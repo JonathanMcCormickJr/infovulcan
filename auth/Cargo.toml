@@ -24,7 +24,7 @@ proto = { path = "../proto" }
 # Crypto & Auth
 argon2 = "0.5"
 jsonwebtoken = { version = "10.2", default-features = false, features = ["rust_crypto"] }
-rand = "0.10.0"
+rand = "0.10.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
