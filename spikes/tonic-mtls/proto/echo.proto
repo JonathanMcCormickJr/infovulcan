@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package echo;
+
+// Minimal one-RPC service — just enough surface area to prove that an
+// end-to-end mTLS-protected gRPC call works.
+service Echo {
+  rpc Say (SayRequest) returns (SayReply);
+}
+
+message SayRequest {
+  string text = 1;
+}
+
+message SayReply {
+  string text = 1;
+}

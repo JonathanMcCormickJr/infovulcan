@@ -1,0 +1,27 @@
+[package]
+name = "spike-tonic-mtls"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Week 1 spike: a minimal tonic client/server pair running over rustls with
+# mutual TLS. Validates the mental model behind the "mTLS everywhere"
+# Hardened-stage requirement before touching production code.
+
+[dependencies]
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+[dev-dependencies]
+rcgen = "0.14"
+anyhow = "1.0"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3.2"

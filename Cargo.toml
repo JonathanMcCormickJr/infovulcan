@@ -10,6 +10,8 @@ members = [
     "lbrp",
     "proto",
     "shared",
+    "spikes/raft-toy",
+    "spikes/tonic-mtls",
     "tests",
     "web",
 ]
