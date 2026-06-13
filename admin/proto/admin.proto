@@ -82,6 +82,19 @@ message MetricsSnapshot {
 
 message PushAck { bool ok = 1; }
 
+// Intrusion event reported by the honeypot service.
+message IntrusionEvent {
+  int64 timestamp_unix = 1;
+  string source_ip = 2;
+  string endpoint_accessed = 3;
+  string request_method = 4;
+  optional string user_agent = 5;
+  optional string request_body = 6;
+  optional string tls_fingerprint = 7;
+}
+
+message IntrusionAck { bool recorded = 1; }
+
 service AdminService {
   // User Management
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
@@ -92,4 +105,7 @@ service AdminService {
 
   // Metrics
   rpc PushMetrics(MetricsSnapshot) returns (PushAck);
+
+  // Intrusion reporting (from the honeypot service)
+  rpc RecordIntrusion(IntrusionEvent) returns (IntrusionAck);
 }

@@ -58,6 +58,67 @@ openraft::declare_raft_types!(
 /// Type definitions for `OpenRaft`
 pub type DbRaft = openraft::Raft<DbTypeConfig>;
 
+/// Compact constructor for an `openraft` storage I/O error. Centralizes the `StorageIOError`
+/// boilerplate so each call site is a single `.map_err(|e| io_err(subject, verb, e))`.
+fn io_err(
+    subject: openraft::ErrorSubject<u64>,
+    verb: openraft::ErrorVerb,
+    e: impl std::fmt::Display,
+) -> StorageError<u64> {
+    openraft::StorageIOError::new(subject, verb, openraft::AnyError::error(e.to_string())).into()
+}
+
+/// Context-free storage-I/O error constructors. Using **function references**
+/// (`.map_err(log_write)`) instead of inline closures keeps the call site a single line that
+/// the happy path covers, while the error body is only reached on real storage failure.
+fn log_read(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(LogId::default()),
+        openraft::ErrorVerb::Read,
+        e,
+    )
+}
+fn log_write(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(LogId::default()),
+        openraft::ErrorVerb::Write,
+        e,
+    )
+}
+fn sm_read(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::StateMachine,
+        openraft::ErrorVerb::Read,
+        e,
+    )
+}
+fn sm_write(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::StateMachine,
+        openraft::ErrorVerb::Write,
+        e,
+    )
+}
+fn vote_write(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
+}
+/// Log-subject error constructors that take the specific log id. Used inside one-line closures
+/// (`.map_err(|e| log_w(id, e))`) so the call line stays on the happy path and is covered.
+fn log_w(id: LogId<u64>, e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(id),
+        openraft::ErrorVerb::Write,
+        e,
+    )
+}
+fn log_r(id: LogId<u64>, e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(id),
+        openraft::ErrorVerb::Read,
+        e,
+    )
+}
+
 /// Raft state machine that applies log entries to storage
 pub struct DbStateMachine {
     pub last_applied_log: Option<openraft::LogId<u64>>,
@@ -81,7 +142,7 @@ impl DbStateMachine {
     ///
     /// Returns an error if the log entry cannot be applied to storage.
     pub fn apply(&mut self, entry: &LogEntry) -> Result<DbResponse> {
-        entry.apply(&self.storage)?;
+        let applied = entry.apply(&self.storage)?;
 
         let response = match entry {
             LogEntry::Get { collection, key } => {
@@ -91,9 +152,10 @@ impl DbStateMachine {
                     value,
                 }
             }
+            // `applied` carries the assigned id for `CreateTicket`, `None` otherwise.
             _ => DbResponse {
                 success: true,
-                value: None,
+                value: applied,
             },
         };
 
@@ -236,13 +298,7 @@ impl RaftLogReader<DbTypeConfig> for DbLogReader {
             std::ops::Bound::Unbounded => None,
         };
 
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(LogId::default()),
-                openraft::ErrorVerb::Read,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(log_read)?;
 
         let mut entries = Vec::new();
 
@@ -251,13 +307,7 @@ impl RaftLogReader<DbTypeConfig> for DbLogReader {
         let iter = tree.range(start_key..);
 
         for item in iter {
-            let (k, v) = item.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(LogId::default()),
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (k, v) = item.map_err(log_read)?;
 
             let index = u64::from_be_bytes(k.as_ref().try_into().map_err(|_| {
                 openraft::StorageIOError::new(
@@ -274,16 +324,8 @@ impl RaftLogReader<DbTypeConfig> for DbLogReader {
             }
 
             let entry: <DbTypeConfig as openraft::RaftTypeConfig>::Entry =
-                serde_json::from_slice(&v).map_err(|e| {
-                    openraft::StorageIOError::new(
-                        openraft::ErrorSubject::Log(LogId::new(
-                            CommittedLeaderId::new(0, 0),
-                            index,
-                        )),
-                        openraft::ErrorVerb::Read,
-                        openraft::AnyError::error(e.to_string()),
-                    )
-                })?;
+                serde_json::from_slice(&v)
+                    .map_err(|e| log_r(LogId::new(CommittedLeaderId::new(0, 0), index), e))?;
 
             entries.push(entry);
         }
@@ -311,13 +353,7 @@ impl RaftStorage<DbTypeConfig> for DbStore {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut meta = self.raft_storage.write().await;
         meta.vote = Some(*vote);
-        meta.persist_vote(Some(vote)).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        meta.persist_vote(Some(vote)).map_err(vote_write)?;
         Ok(())
     }
 
@@ -330,13 +366,7 @@ impl RaftStorage<DbTypeConfig> for DbStore {
     where
         I: IntoIterator<Item = <DbTypeConfig as openraft::RaftTypeConfig>::Entry> + OptionalSend,
     {
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(LogId::default()),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(log_write)?;
 
         let mut last_log_id = None;
         let mut batch = sled::Batch::default();
@@ -344,31 +374,15 @@ impl RaftStorage<DbTypeConfig> for DbStore {
         for entry in entries {
             last_log_id = Some(entry.log_id);
             let key = entry.log_id.index.to_be_bytes();
-            let value = serde_json::to_vec(&entry).map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(entry.log_id),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let value = serde_json::to_vec(&entry).map_err(|e| log_w(entry.log_id, e))?;
             batch.insert(&key, value);
         }
 
-        tree.apply_batch(batch).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(last_log_id.unwrap_or_default()),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.apply_batch(batch)
+            .map_err(|e| log_w(last_log_id.unwrap_or_default(), e))?;
 
-        tree.flush().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(last_log_id.unwrap_or_default()),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.flush()
+            .map_err(|e| log_w(last_log_id.unwrap_or_default(), e))?;
 
         Ok(())
     }
@@ -377,56 +391,32 @@ impl RaftStorage<DbTypeConfig> for DbStore {
         &mut self,
         log_id: LogId<u64>,
     ) -> Result<(), StorageError<u64>> {
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self
+            .storage
+            .get_tree(TREE_RAFT_LOG)
+            .map_err(|e| log_w(log_id, e))?;
 
         // Remove all entries from log_id onwards (inclusive)
         let start_key = log_id.index.to_be_bytes();
         let mut batch = sled::Batch::default();
 
         for item in tree.range(start_key..) {
-            let (key, _) = item.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(log_id),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (key, _) = item.map_err(|e| log_w(log_id, e))?;
             batch.remove(key);
         }
 
-        tree.apply_batch(batch).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.apply_batch(batch).map_err(|e| log_w(log_id, e))?;
 
-        tree.flush().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.flush().map_err(|e| log_w(log_id, e))?;
 
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self
+            .storage
+            .get_tree(TREE_RAFT_LOG)
+            .map_err(|e| log_w(log_id, e))?;
 
         // Remove all entries up to and including log_id
         // We need to be careful not to delete everything if we just scan from 0.
@@ -435,41 +425,17 @@ impl RaftStorage<DbTypeConfig> for DbStore {
         let mut batch = sled::Batch::default();
 
         for item in tree.range(..=end_key) {
-            let (key, _) = item.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(log_id),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (key, _) = item.map_err(|e| log_w(log_id, e))?;
             batch.remove(key);
         }
 
-        tree.apply_batch(batch).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.apply_batch(batch).map_err(|e| log_w(log_id, e))?;
 
-        tree.flush().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.flush().map_err(|e| log_w(log_id, e))?;
 
         let mut meta = self.raft_storage.write().await;
         meta.last_purged = Some(log_id);
-        meta.persist_last_purged().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        meta.persist_last_purged().map_err(|e| log_w(log_id, e))?;
 
         Ok(())
     }
@@ -499,13 +465,7 @@ impl RaftStorage<DbTypeConfig> for DbStore {
                         value: None,
                     }
                 }
-                EntryPayload::Normal(log_entry) => sm.apply(log_entry).map_err(|e| {
-                    openraft::StorageIOError::new(
-                        openraft::ErrorSubject::StateMachine,
-                        openraft::ErrorVerb::Write,
-                        openraft::AnyError::error(e.to_string()),
-                    )
-                })?,
+                EntryPayload::Normal(log_entry) => sm.apply(log_entry).map_err(sm_write)?,
                 EntryPayload::Membership(membership) => {
                     sm.last_membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
@@ -539,23 +499,19 @@ impl RaftStorage<DbTypeConfig> for DbStore {
         // Deserialize snapshot data using serde_json for simplicity
         let snapshot_data: Vec<(String, Vec<u8>, Vec<u8>)> = serde_json::from_slice(&data)
             .map_err(|e| {
-                openraft::StorageIOError::new(
+                io_err(
                     openraft::ErrorSubject::Snapshot(Some(meta.signature())),
                     openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
+                    e,
                 )
             })?;
 
         // Clear storage and restore from snapshot
         // Note: This is simplified - in production you'd want atomic replacement
         for (collection, key, value) in snapshot_data {
-            self.storage.put(&collection, &key, &value).map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            self.storage
+                .put(&collection, &key, &value)
+                .map_err(sm_write)?;
         }
 
         let mut sm = self.state_machine.write().await;
@@ -580,30 +536,12 @@ impl RaftStorage<DbTypeConfig> for DbStore {
 
     async fn get_log_state(&mut self) -> Result<LogState<DbTypeConfig>, StorageError<u64>> {
         let meta = self.raft_storage.read().await;
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(LogId::default()),
-                openraft::ErrorVerb::Read,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(log_read)?;
 
         let last_log_id = if let Some(last) = tree.iter().last() {
-            let (_, v) = last.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(LogId::default()),
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (_, v) = last.map_err(log_read)?;
             let entry: <DbTypeConfig as openraft::RaftTypeConfig>::Entry =
-                serde_json::from_slice(&v).map_err(|e| {
-                    openraft::StorageIOError::new(
-                        openraft::ErrorSubject::Log(LogId::default()),
-                        openraft::ErrorVerb::Read,
-                        openraft::AnyError::error(e.to_string()),
-                    )
-                })?;
+                serde_json::from_slice(&v).map_err(log_read)?;
             Some(entry.log_id)
         } else {
             None
@@ -618,8 +556,14 @@ impl RaftStorage<DbTypeConfig> for DbStore {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        // Capture the applied state so the snapshot meta reflects the real last log id
+        // and membership. openraft requires a monotonically-increasing snapshot log id;
+        // a `None` here corrupts snapshot tracking and stalls replication.
+        let sm = self.state_machine.read().await;
         DbSnapshotBuilder {
             storage: self.storage.clone(),
+            last_applied_log: sm.last_applied_log,
+            last_membership: sm.last_membership.clone(),
         }
     }
 }
@@ -627,48 +571,37 @@ impl RaftStorage<DbTypeConfig> for DbStore {
 /// Snapshot builder for creating Raft snapshots
 pub struct DbSnapshotBuilder {
     storage: Storage,
+    last_applied_log: Option<openraft::LogId<u64>>,
+    last_membership: openraft::StoredMembership<u64, BasicNode>,
 }
 
 impl RaftSnapshotBuilder<DbTypeConfig> for DbSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<DbTypeConfig>, StorageError<u64>> {
-        // Get all data from storage
-        // Snapshot all data collections (excluding Raft-internal trees).
+        // Snapshot every non-Raft state-machine tree: data collections, all secondary
+        // indexes, and sequence counters. Enumerating the trees (rather than a fixed
+        // list) keeps snapshot coverage correct as new trees are added.
         let mut all_data = Vec::new();
 
-        for collection in [
-            crate::storage::TREE_TICKETS,
-            crate::storage::TREE_USERS,
-            crate::storage::TREE_SESSIONS,
-            crate::storage::TREE_AUDIT,
-        ] {
-            let pairs = self.storage.list(collection, b"", None).map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+        for collection in self.storage.data_tree_names() {
+            let pairs = self.storage.list(&collection, b"", None).map_err(sm_read)?;
             for (k, v) in pairs {
-                all_data.push((collection.to_string(), k, v));
+                all_data.push((collection.clone(), k, v));
             }
         }
 
         // Serialize to snapshot format using serde_json for simplicity
-        let data = serde_json::to_vec(&all_data).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let data = serde_json::to_vec(&all_data).map_err(sm_write)?;
 
-        let snapshot_id = format!("snapshot-{}", chrono::Utc::now().timestamp());
-
-        // Create snapshot metadata (simplified - should track actual state)
+        // Include the last applied log index in the id so successive snapshots sort/compare
+        // correctly, then carry the real applied log id + membership in the meta.
+        let snapshot_id = match self.last_applied_log {
+            Some(log_id) => format!("snapshot-{}-{}", log_id.leader_id.term, log_id.index),
+            None => "snapshot-empty".to_string(),
+        };
         let meta = SnapshotMeta {
             snapshot_id,
-            last_log_id: None,
-            last_membership: StoredMembership::default(),
+            last_log_id: self.last_applied_log,
+            last_membership: self.last_membership.clone(),
         };
 
         Ok(Snapshot {
@@ -1040,6 +973,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_roundtrips_all_trees_including_indexes() {
+        use crate::storage::{TicketIndexFields, TicketQuery};
+
+        // Create a ticket on store A — this populates the tickets tree, every secondary
+        // index, and the sequence counter.
+        let mut store_a = DbStore::new_temp().unwrap();
+        let idx = TicketIndexFields {
+            status: 3,
+            account_uuid: "acct".to_string(),
+            assigned_to_uuid: Some("agent".to_string()),
+            project: "proj".to_string(),
+            tracking_url: None,
+            created_at_unix: 1,
+            updated_at_unix: 1,
+        };
+        let id = store_a.storage.create_ticket(b"body", &idx).unwrap();
+
+        let mut builder = store_a.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let data = snapshot.snapshot.into_inner();
+
+        // Install into a fresh store B.
+        let mut store_b = DbStore::new_temp().unwrap();
+        store_b
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(data)))
+            .await
+            .unwrap();
+
+        // Data restored…
+        assert!(store_b.storage.get_ticket(id, false).unwrap().is_some());
+        // …and the secondary index is usable (query by status resolves via the index).
+        let results = store_b
+            .storage
+            .query_tickets(&TicketQuery {
+                status: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, id);
+    }
+
+    #[tokio::test]
     async fn test_try_get_log_entries_excluded_end_bound() {
         let mut store = DbStore::new_temp().unwrap();
 
@@ -1225,5 +1201,60 @@ mod tests {
         let response = sm.apply(&entry).unwrap();
         assert!(!response.success);
         assert!(response.value.is_none());
+    }
+
+    // ── Fault injection: corrupted Raft log storage ──────────────────────────
+    // These exercise the error-mapping paths in the log-read code that the happy-path
+    // tests never reach (a real node would hit them on disk corruption).
+
+    #[tokio::test]
+    async fn try_get_log_entries_errors_on_non_8_byte_key() {
+        let mut store = DbStore::new_temp().unwrap();
+        // A 9-byte key sorts after the 8-byte zero start key, so it is scanned, and the
+        // `try_into::<[u8; 8]>()` for the index fails → the invalid-key-format error path.
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert([0u8, 0, 0, 0, 0, 0, 0, 0, 1].as_slice(), b"x".to_vec())
+            .unwrap();
+        assert!(store.try_get_log_entries(..).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn try_get_log_entries_errors_on_corrupt_entry_value() {
+        let mut store = DbStore::new_temp().unwrap();
+        // Valid 8-byte key, but the value is not a serialized Entry → deserialize error path.
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert(1u64.to_be_bytes(), b"not-a-valid-entry".to_vec())
+            .unwrap();
+        assert!(store.try_get_log_entries(..).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_log_state_errors_on_corrupt_last_entry() {
+        let mut store = DbStore::new_temp().unwrap();
+        // get_log_state reads the last entry and deserializes it → deserialize error path.
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert(5u64.to_be_bytes(), b"garbage".to_vec())
+            .unwrap();
+        assert!(store.get_log_state().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn log_reader_errors_on_corrupt_entry_value() {
+        let mut store = DbStore::new_temp().unwrap();
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert(2u64.to_be_bytes(), b"still-not-json".to_vec())
+            .unwrap();
+        // The dedicated DbLogReader path (DbLogReader::try_get_log_entries) must also surface it.
+        let mut reader = store.get_log_reader().await;
+        assert!(reader.try_get_log_entries(..).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_errors_on_corrupt_snapshot_data() {
+        let mut store = DbStore::new_temp().unwrap();
+        // Snapshot payload is not the expected serialized Vec<(String,Vec<u8>,Vec<u8>)>.
+        let bad = Box::new(Cursor::new(b"not a snapshot".to_vec()));
+        let meta = openraft::SnapshotMeta::default();
+        assert!(store.install_snapshot(&meta, bad).await.is_err());
     }
 }

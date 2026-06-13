@@ -28,6 +28,9 @@ rand = "0.10.1"
 # Serialization (used by key_store for keypair persistence)
 serde_json = "1.0"
 
+# Static service-discovery config (services.toml)
+toml = "0.8"
+
 # Error handling
 anyhow = "1.0"
 

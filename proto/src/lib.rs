@@ -19,3 +19,13 @@ pub mod custodian {
 pub mod db {
     tonic::include_proto!("db");
 }
+
+pub mod honeypot {
+    tonic::include_proto!("honeypot");
+}
+
+#[allow(clippy::doc_markdown)]
+pub mod tls;
+
+#[allow(clippy::doc_markdown)]
+pub mod pqc;

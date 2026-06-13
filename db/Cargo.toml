@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 # Core async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
 
 # gRPC framework
 tonic = "0.14"
@@ -47,4 +48,5 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3.8"
+rcgen = "0.14"
 

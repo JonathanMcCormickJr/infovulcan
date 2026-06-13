@@ -56,7 +56,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "[::1]:8082".to_string())
         .parse()?;
     let db_addr = env::var("DB_ADDR").unwrap_or_else(|_| "http://[::1]:8080".to_string());
-    let storage_path = env::var("STORAGE_PATH").unwrap_or_else(|_| "/tmp/infovulcan-auth".to_string());
+    let storage_path =
+        env::var("STORAGE_PATH").unwrap_or_else(|_| "/tmp/infovulcan-auth".to_string());
 
     // Ensure storage path exists
     fs::create_dir_all(&storage_path)?;
@@ -69,7 +70,8 @@ async fn main() -> Result<()> {
 
     // Connect to DB
     info!("Connecting to DB at {}", db_addr);
-    let db_client = server::db::database_client::DatabaseClient::connect(db_addr).await?;
+    let channel = proto::tls::connect(&db_addr).await?;
+    let db_client = server::db::database_client::DatabaseClient::new(channel);
     let db_client = Arc::new(Mutex::new(db_client));
 
     // Create service
@@ -77,7 +79,7 @@ async fn main() -> Result<()> {
 
     info!("Auth service listening on {}", listen_addr);
 
-    Server::builder()
+    proto::tls::apply_server_tls(Server::builder())?
         .add_service(AuthServiceServer::new(auth_service))
         .serve(listen_addr)
         .await?;

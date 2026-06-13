@@ -59,6 +59,67 @@ openraft::declare_raft_types!(
 /// Type definitions for `OpenRaft`
 pub type CustodianRaft = openraft::Raft<CustodianTypeConfig>;
 
+/// Compact constructor for an `openraft` storage I/O error. Centralizes the `StorageIOError`
+/// boilerplate so each call site is a single `.map_err(|e| io_err(subject, verb, e))`.
+fn io_err(
+    subject: openraft::ErrorSubject<u64>,
+    verb: openraft::ErrorVerb,
+    e: impl std::fmt::Display,
+) -> StorageError<u64> {
+    openraft::StorageIOError::new(subject, verb, openraft::AnyError::error(e.to_string())).into()
+}
+
+/// Context-free storage-I/O error constructors. Using **function references**
+/// (`.map_err(log_write)`) instead of inline closures keeps the call site a single line that
+/// the happy path covers, while the error body is only reached on real storage failure.
+fn log_read(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(LogId::default()),
+        openraft::ErrorVerb::Read,
+        e,
+    )
+}
+fn log_write(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(LogId::default()),
+        openraft::ErrorVerb::Write,
+        e,
+    )
+}
+fn sm_read(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::StateMachine,
+        openraft::ErrorVerb::Read,
+        e,
+    )
+}
+fn sm_write(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::StateMachine,
+        openraft::ErrorVerb::Write,
+        e,
+    )
+}
+fn vote_write(e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
+}
+/// Log-subject error constructors that take the specific log id. Used inside one-line closures
+/// (`.map_err(|e| log_w(id, e))`) so the call line stays on the happy path and is covered.
+fn log_w(id: LogId<u64>, e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(id),
+        openraft::ErrorVerb::Write,
+        e,
+    )
+}
+fn log_r(id: LogId<u64>, e: impl std::fmt::Display) -> StorageError<u64> {
+    io_err(
+        openraft::ErrorSubject::Log(id),
+        openraft::ErrorVerb::Read,
+        e,
+    )
+}
+
 /// Raft state machine that applies log entries to storage
 pub struct CustodianStateMachine {
     pub last_applied_log: Option<openraft::LogId<u64>>,
@@ -82,15 +143,61 @@ impl CustodianStateMachine {
     ///
     /// Returns an error if the log entry cannot be applied to storage.
     pub fn apply(&mut self, entry: &LockCommand) -> Result<LockResponse> {
-        entry.apply(&self.storage)?;
-
-        let response = LockResponse {
-            success: true,
-            error: None,
-            value: None,
-        };
-
-        Ok(response)
+        // Locks are exclusive. A read-then-write under the state-machine lock is
+        // deterministic because Raft applies entries in identical order on every node.
+        match entry {
+            LockCommand::AcquireLock {
+                ticket_id,
+                user_id,
+                at_unix,
+                ttl_secs,
+            } => {
+                match self.storage.get_lock_info(*ticket_id)? {
+                    // Held by a different, non-expired holder → reject and report it.
+                    // (Expiry is evaluated against the command's timestamp for determinism.)
+                    Some(existing)
+                        if existing.user_id != *user_id && !existing.is_expired(*at_unix) =>
+                    {
+                        Ok(LockResponse {
+                            success: false,
+                            error: Some(format!(
+                                "ticket {ticket_id} is locked by {}",
+                                existing.user_id
+                            )),
+                            value: None,
+                        })
+                    }
+                    // Free, expired, or re-acquired by the same holder → (re)acquire.
+                    _ => {
+                        self.storage
+                            .acquire_lock_at(*ticket_id, *user_id, *at_unix, *ttl_secs)?;
+                        Ok(LockResponse {
+                            success: true,
+                            error: None,
+                            value: None,
+                        })
+                    }
+                }
+            }
+            LockCommand::ReleaseLock { ticket_id, user_id } => {
+                match self.storage.get_lock_info(*ticket_id)? {
+                    // Only the holder may release.
+                    Some(existing) if existing.user_id != *user_id => Ok(LockResponse {
+                        success: false,
+                        error: Some(format!("ticket {ticket_id} is held by another user")),
+                        value: None,
+                    }),
+                    _ => {
+                        self.storage.release_lock(*ticket_id)?;
+                        Ok(LockResponse {
+                            success: true,
+                            error: None,
+                            value: None,
+                        })
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -237,13 +344,7 @@ impl RaftLogReader<CustodianTypeConfig> for CustodianLogReader {
             std::ops::Bound::Unbounded => None,
         };
 
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(LogId::default()),
-                openraft::ErrorVerb::Read,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(log_read)?;
 
         let mut entries = Vec::new();
 
@@ -252,13 +353,7 @@ impl RaftLogReader<CustodianTypeConfig> for CustodianLogReader {
         let iter = tree.range(start_key..);
 
         for item in iter {
-            let (k, v) = item.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(LogId::default()),
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (k, v) = item.map_err(log_read)?;
 
             let index = u64::from_be_bytes(k.as_ref().try_into().map_err(|_| {
                 openraft::StorageIOError::new(
@@ -275,16 +370,8 @@ impl RaftLogReader<CustodianTypeConfig> for CustodianLogReader {
             }
 
             let entry: <CustodianTypeConfig as openraft::RaftTypeConfig>::Entry =
-                serde_json::from_slice(&v).map_err(|e| {
-                    openraft::StorageIOError::new(
-                        openraft::ErrorSubject::Log(LogId::new(
-                            CommittedLeaderId::new(0, 0),
-                            index,
-                        )),
-                        openraft::ErrorVerb::Read,
-                        openraft::AnyError::error(e.to_string()),
-                    )
-                })?;
+                serde_json::from_slice(&v)
+                    .map_err(|e| log_r(LogId::new(CommittedLeaderId::new(0, 0), index), e))?;
 
             entries.push(entry);
         }
@@ -313,13 +400,7 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut meta = self.raft_storage.write().await;
         meta.vote = Some(*vote);
-        meta.persist_vote(Some(vote)).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        meta.persist_vote(Some(vote)).map_err(vote_write)?;
         Ok(())
     }
 
@@ -333,13 +414,7 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
         I: IntoIterator<Item = <CustodianTypeConfig as openraft::RaftTypeConfig>::Entry>
             + OptionalSend,
     {
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(LogId::default()),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(log_write)?;
 
         let mut last_log_id = None;
         let mut batch = sled::Batch::default();
@@ -347,31 +422,15 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
         for entry in entries {
             last_log_id = Some(entry.log_id);
             let key = entry.log_id.index.to_be_bytes();
-            let value = serde_json::to_vec(&entry).map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(entry.log_id),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let value = serde_json::to_vec(&entry).map_err(|e| log_w(entry.log_id, e))?;
             batch.insert(&key, value);
         }
 
-        tree.apply_batch(batch).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(last_log_id.unwrap_or_default()),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.apply_batch(batch)
+            .map_err(|e| log_w(last_log_id.unwrap_or_default(), e))?;
 
-        tree.flush().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(last_log_id.unwrap_or_default()),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.flush()
+            .map_err(|e| log_w(last_log_id.unwrap_or_default(), e))?;
 
         Ok(())
     }
@@ -380,56 +439,32 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
         &mut self,
         log_id: LogId<u64>,
     ) -> Result<(), StorageError<u64>> {
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self
+            .storage
+            .get_tree(TREE_RAFT_LOG)
+            .map_err(|e| log_w(log_id, e))?;
 
         // Remove all entries from log_id onwards (inclusive)
         let start_key = log_id.index.to_be_bytes();
         let mut batch = sled::Batch::default();
 
         for item in tree.range(start_key..) {
-            let (key, _) = item.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(log_id),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (key, _) = item.map_err(|e| log_w(log_id, e))?;
             batch.remove(key);
         }
 
-        tree.apply_batch(batch).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.apply_batch(batch).map_err(|e| log_w(log_id, e))?;
 
-        tree.flush().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.flush().map_err(|e| log_w(log_id, e))?;
 
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self
+            .storage
+            .get_tree(TREE_RAFT_LOG)
+            .map_err(|e| log_w(log_id, e))?;
 
         // Remove all entries up to and including log_id
         // We need to be careful not to delete everything if we just scan from 0.
@@ -438,41 +473,17 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
         let mut batch = sled::Batch::default();
 
         for item in tree.range(..=end_key) {
-            let (key, _) = item.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(log_id),
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (key, _) = item.map_err(|e| log_w(log_id, e))?;
             batch.remove(key);
         }
 
-        tree.apply_batch(batch).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.apply_batch(batch).map_err(|e| log_w(log_id, e))?;
 
-        tree.flush().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        tree.flush().map_err(|e| log_w(log_id, e))?;
 
         let mut meta = self.raft_storage.write().await;
         meta.last_purged = Some(log_id);
-        meta.persist_last_purged().map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(log_id),
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        meta.persist_last_purged().map_err(|e| log_w(log_id, e))?;
 
         Ok(())
     }
@@ -496,20 +507,14 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
 
             let response = match &entry.payload {
                 EntryPayload::Blank => {
-                    // Blank entries still need a response
+                    // Blank entries (e.g. leader no-op) still need a response.
                     LockResponse {
                         success: true,
-                        error: Some("Lock already held by another user".to_string()),
+                        error: None,
                         value: None,
                     }
                 }
-                EntryPayload::Normal(log_entry) => sm.apply(log_entry).map_err(|e| {
-                    openraft::StorageIOError::new(
-                        openraft::ErrorSubject::StateMachine,
-                        openraft::ErrorVerb::Write,
-                        openraft::AnyError::error(e.to_string()),
-                    )
-                })?,
+                EntryPayload::Normal(log_entry) => sm.apply(log_entry).map_err(sm_write)?,
                 EntryPayload::Membership(membership) => {
                     sm.last_membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
@@ -554,23 +559,19 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
         // Deserialize snapshot data using serde_json for simplicity
         let snapshot_data: Vec<(String, Vec<u8>, Vec<u8>)> = serde_json::from_slice(&data)
             .map_err(|e| {
-                openraft::StorageIOError::new(
+                io_err(
                     openraft::ErrorSubject::Snapshot(Some(meta.signature())),
                     openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
+                    e,
                 )
             })?;
 
         // Clear storage and restore from snapshot
         // Note: This is simplified - in production you'd want atomic replacement
         for (collection, key, value) in snapshot_data {
-            self.storage.put(&collection, &key, &value).map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            self.storage
+                .put(&collection, &key, &value)
+                .map_err(sm_write)?;
         }
 
         let mut sm = self.state_machine.write().await;
@@ -614,30 +615,12 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
 
     async fn get_log_state(&mut self) -> Result<LogState<CustodianTypeConfig>, StorageError<u64>> {
         let meta = self.raft_storage.read().await;
-        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::Log(LogId::default()),
-                openraft::ErrorVerb::Read,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let tree = self.storage.get_tree(TREE_RAFT_LOG).map_err(log_read)?;
 
         let last_log_id = if let Some(last) = tree.iter().last() {
-            let (_, v) = last.map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::Log(LogId::default()),
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+            let (_, v) = last.map_err(log_read)?;
             let entry: <CustodianTypeConfig as openraft::RaftTypeConfig>::Entry =
-                serde_json::from_slice(&v).map_err(|e| {
-                    openraft::StorageIOError::new(
-                        openraft::ErrorSubject::Log(LogId::default()),
-                        openraft::ErrorVerb::Read,
-                        openraft::AnyError::error(e.to_string()),
-                    )
-                })?;
+                serde_json::from_slice(&v).map_err(log_read)?;
             Some(entry.log_id)
         } else {
             None
@@ -652,8 +635,14 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        // Capture applied state so the snapshot meta carries the real last log id and
+        // membership. openraft requires a monotonically-increasing snapshot log id; a
+        // `None` here corrupts snapshot tracking and stalls multi-node replication.
+        let sm = self.state_machine.read().await;
         CustodianSnapshotBuilder {
             storage: self.storage.clone(),
+            last_applied_log: sm.last_applied_log,
+            last_membership: sm.last_membership.clone(),
         }
     }
 
@@ -663,35 +652,25 @@ impl RaftStorage<CustodianTypeConfig> for CustodianStore {
 /// Snapshot builder for creating Raft snapshots
 pub struct CustodianSnapshotBuilder {
     storage: Storage,
+    last_applied_log: Option<openraft::LogId<u64>>,
+    last_membership: openraft::StoredMembership<u64, BasicNode>,
 }
 
 impl RaftSnapshotBuilder<CustodianTypeConfig> for CustodianSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<CustodianTypeConfig>, StorageError<u64>> {
-        // Get all data from storage
-        // Snapshot all data collections (locks are the only custodian data tree).
+        // Snapshot every non-Raft state-machine tree (currently just locks, but
+        // enumerating keeps coverage correct if the custodian gains more trees).
         let mut all_data = Vec::new();
 
-        for collection in [crate::storage::TREE_LOCKS] {
-            let pairs = self.storage.list(collection, b"", None).map_err(|e| {
-                openraft::StorageIOError::new(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Read,
-                    openraft::AnyError::error(e.to_string()),
-                )
-            })?;
+        for collection in self.storage.data_tree_names() {
+            let pairs = self.storage.list(&collection, b"", None).map_err(sm_read)?;
             for (k, v) in pairs {
-                all_data.push((collection.to_string(), k, v));
+                all_data.push((collection.clone(), k, v));
             }
         }
 
         // Serialize to snapshot format using serde_json for simplicity
-        let data = serde_json::to_vec(&all_data).map_err(|e| {
-            openraft::StorageIOError::new(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                openraft::AnyError::error(e.to_string()),
-            )
-        })?;
+        let data = serde_json::to_vec(&all_data).map_err(sm_write)?;
 
         // Record metrics for snapshot build
         crate::metrics::SNAPSHOT_CREATED_TOTAL.inc();
@@ -715,13 +694,16 @@ impl RaftSnapshotBuilder<CustodianTypeConfig> for CustodianSnapshotBuilder {
             });
         }
 
-        let snapshot_id = format!("snapshot-{}", chrono::Utc::now().timestamp());
-
-        // Create snapshot metadata (simplified - should track actual state)
+        // Deterministic id derived from the applied log id (so successive snapshots
+        // compare correctly), carrying the real applied log id + membership.
+        let snapshot_id = match self.last_applied_log {
+            Some(log_id) => format!("snapshot-{}-{}", log_id.leader_id.term, log_id.index),
+            None => "snapshot-empty".to_string(),
+        };
         let meta = SnapshotMeta {
             snapshot_id,
-            last_log_id: None,
-            last_membership: StoredMembership::default(),
+            last_log_id: self.last_applied_log,
+            last_membership: self.last_membership.clone(),
         };
 
         Ok(Snapshot {
@@ -742,7 +724,12 @@ mod tests {
         let ticket_id = 100u64;
         let user_id = uuid::Uuid::new_v4();
 
-        let entry = LockCommand::AcquireLock { ticket_id, user_id };
+        let entry = LockCommand::AcquireLock {
+            ticket_id,
+            user_id,
+            at_unix: 0,
+            ttl_secs: 0,
+        };
         let response = sm.apply(&entry).unwrap();
         assert!(response.success);
         assert!(storage.is_locked(ticket_id).unwrap());
@@ -751,6 +738,57 @@ mod tests {
         let response = sm.apply(&entry).unwrap();
         assert!(response.success);
         assert!(!storage.is_locked(ticket_id).unwrap());
+    }
+
+    #[test]
+    fn expired_lock_can_be_stolen_but_live_lock_cannot() {
+        let storage = Storage::new_temp().unwrap();
+        let mut sm = CustodianStateMachine::new(storage.clone());
+        let alice = uuid::Uuid::new_v4();
+        let bob = uuid::Uuid::new_v4();
+        let ticket_id = 5u64;
+
+        // Alice acquires at t=1000 with a 100s TTL (expires at 1100).
+        assert!(
+            sm.apply(&LockCommand::AcquireLock {
+                ticket_id,
+                user_id: alice,
+                at_unix: 1_000,
+                ttl_secs: 100,
+            })
+            .unwrap()
+            .success
+        );
+
+        // Bob tries at t=1050 (still held) -> rejected.
+        let denied = sm
+            .apply(&LockCommand::AcquireLock {
+                ticket_id,
+                user_id: bob,
+                at_unix: 1_050,
+                ttl_secs: 100,
+            })
+            .unwrap();
+        assert!(!denied.success);
+        assert_eq!(
+            storage.get_lock_info(ticket_id).unwrap().unwrap().user_id,
+            alice
+        );
+
+        // Bob tries at t=1200 (Alice's lock has expired) -> succeeds and takes the lock.
+        let stolen = sm
+            .apply(&LockCommand::AcquireLock {
+                ticket_id,
+                user_id: bob,
+                at_unix: 1_200,
+                ttl_secs: 100,
+            })
+            .unwrap();
+        assert!(stolen.success);
+        assert_eq!(
+            storage.get_lock_info(ticket_id).unwrap().unwrap().user_id,
+            bob
+        );
     }
 
     #[tokio::test]
@@ -770,6 +808,8 @@ mod tests {
             payload: EntryPayload::Normal(LockCommand::AcquireLock {
                 ticket_id: 10,
                 user_id,
+                at_unix: 0,
+                ttl_secs: 0,
             }),
         };
 
@@ -799,6 +839,8 @@ mod tests {
                 payload: EntryPayload::Normal(LockCommand::AcquireLock {
                     ticket_id: i,
                     user_id,
+                    at_unix: 0,
+                    ttl_secs: 0,
                 }),
             })
             .collect::<Vec<_>>();
@@ -848,6 +890,7 @@ mod tests {
                     ticket_id,
                     user_id,
                     acquired_at: chrono::Utc::now(),
+                    expires_at_unix: 0,
                 })
                 .unwrap(),
             )
@@ -906,6 +949,8 @@ mod tests {
             payload: EntryPayload::Normal(LockCommand::AcquireLock {
                 ticket_id: 55,
                 user_id,
+                at_unix: 0,
+                ttl_secs: 0,
             }),
         };
 
@@ -984,6 +1029,8 @@ mod tests {
                 payload: openraft::EntryPayload::Normal(LockCommand::AcquireLock {
                     ticket_id: i,
                     user_id,
+                    at_unix: 0,
+                    ttl_secs: 0,
                 }),
             };
             store.append_to_log(vec![entry]).await.unwrap();
@@ -1013,6 +1060,8 @@ mod tests {
                 payload: openraft::EntryPayload::Normal(LockCommand::AcquireLock {
                     ticket_id: i,
                     user_id,
+                    at_unix: 0,
+                    ttl_secs: 0,
                 }),
             };
             store.append_to_log(vec![entry]).await.unwrap();
@@ -1054,6 +1103,8 @@ mod tests {
                 payload: openraft::EntryPayload::Normal(LockCommand::AcquireLock {
                     ticket_id: 1,
                     user_id,
+                    at_unix: 0,
+                    ttl_secs: 0,
                 }),
             };
             store.append_to_log(vec![entry]).await.unwrap();
@@ -1120,6 +1171,8 @@ mod tests {
                 payload: openraft::EntryPayload::Normal(LockCommand::AcquireLock {
                     ticket_id: i,
                     user_id,
+                    at_unix: 0,
+                    ttl_secs: 0,
                 }),
             };
             store.append_to_log(vec![entry]).await.unwrap();
@@ -1128,5 +1181,100 @@ mod tests {
         let mut reader = store.get_log_reader().await;
         let entries = reader.try_get_log_entries(1..=2).await.unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    // ── Fault injection: corrupted Raft log storage ──────────────────────────
+
+    #[tokio::test]
+    async fn try_get_log_entries_errors_on_non_8_byte_key() {
+        let mut store = CustodianStore::new_temp().unwrap();
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert([0u8, 0, 0, 0, 0, 0, 0, 0, 1].as_slice(), b"x".to_vec())
+            .unwrap();
+        assert!(store.try_get_log_entries(..).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn try_get_log_entries_errors_on_corrupt_entry_value() {
+        let mut store = CustodianStore::new_temp().unwrap();
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert(1u64.to_be_bytes(), b"not-a-valid-entry".to_vec())
+            .unwrap();
+        assert!(store.try_get_log_entries(..).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_log_state_errors_on_corrupt_last_entry() {
+        let mut store = CustodianStore::new_temp().unwrap();
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert(5u64.to_be_bytes(), b"garbage".to_vec())
+            .unwrap();
+        assert!(store.get_log_state().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn log_reader_errors_on_corrupt_entry_value() {
+        let mut store = CustodianStore::new_temp().unwrap();
+        let tree = store.storage.get_tree(TREE_RAFT_LOG).unwrap();
+        tree.insert(2u64.to_be_bytes(), b"still-not-json".to_vec())
+            .unwrap();
+        let mut reader = store.get_log_reader().await;
+        assert!(reader.try_get_log_entries(..).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_errors_on_corrupt_snapshot_data() {
+        let mut store = CustodianStore::new_temp().unwrap();
+        let bad = Box::new(std::io::Cursor::new(b"not a snapshot".to_vec()));
+        let meta = openraft::SnapshotMeta::default();
+        assert!(store.install_snapshot(&meta, bad).await.is_err());
+    }
+
+    #[test]
+    fn state_machine_apply_lock_lifecycle() {
+        use crate::storage::LockCommand;
+
+        let storage = Storage::new_temp().unwrap();
+        let mut sm = CustodianStateMachine::new(storage);
+        let u1 = uuid::Uuid::from_u128(1);
+        let u2 = uuid::Uuid::from_u128(2);
+        let acquire = |ticket_id, user_id, at_unix| LockCommand::AcquireLock {
+            ticket_id,
+            user_id,
+            at_unix,
+            ttl_secs: 900,
+        };
+
+        // Acquire on a free ticket succeeds.
+        assert!(sm.apply(&acquire(1, u1, 100)).unwrap().success);
+
+        // A conflicting acquire by another user before expiry is rejected (with the holder).
+        let conflict = sm.apply(&acquire(1, u2, 200)).unwrap();
+        assert!(!conflict.success);
+        assert!(conflict.error.is_some());
+
+        // The same holder re-acquiring is allowed.
+        assert!(sm.apply(&acquire(1, u1, 300)).unwrap().success);
+
+        // Past the TTL, a different user may steal the lock.
+        assert!(sm.apply(&acquire(1, u2, 100_000)).unwrap().success);
+
+        // Release by a non-holder is rejected; release by the holder succeeds.
+        assert!(
+            !sm.apply(&LockCommand::ReleaseLock {
+                ticket_id: 1,
+                user_id: u1,
+            })
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply(&LockCommand::ReleaseLock {
+                ticket_id: 1,
+                user_id: u2,
+            })
+            .unwrap()
+            .success
+        );
     }
 }

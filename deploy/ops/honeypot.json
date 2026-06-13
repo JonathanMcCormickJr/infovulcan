@@ -1,0 +1,21 @@
+{
+  "_comment": "NanoVMs OPS image config for the InfoVulcan honeypot service (deceptive intrusion detection; advertised as 'CriticalBackups'; Hardened only). Reports hits to admin's RecordIntrusion. Place it on a reachable but unadvertised port so any traffic is suspect. UNVALIDATED template — see deploy/README.md.",
+  "Args": [],
+  "Env": {
+    "LISTEN_ADDR": "0.0.0.0:8085",
+    "ADMIN_ADDR": "https://admin:8083",
+    "TLS_CA_CERT": "/etc/infovulcan/certs/ca.crt",
+    "TLS_CERT": "/etc/infovulcan/certs/honeypot.crt",
+    "TLS_KEY": "/etc/infovulcan/certs/honeypot.key",
+    "TLS_DOMAIN": "honeypot",
+    "RUST_LOG": "info"
+  },
+  "MapDirs": {
+    "/etc/infovulcan/certs": "./certs/honeypot"
+  },
+  "RunConfig": {
+    "Ports": ["8085"],
+    "Memory": "256m"
+  },
+  "BaseVolumeSz": "512m"
+}

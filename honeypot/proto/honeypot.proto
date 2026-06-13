@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package honeypot;
+
+// Deceptive high-value-target service. Advertised as "CriticalBackups" to attract
+// attackers. Every call is a synthetic trap: it returns believable fake data and reports
+// the access to the admin service as an intrusion event. No real data is ever touched.
+service HoneypotService {
+  // Fake crypto wallet balance (honeytoken).
+  rpc GetWalletBalance(WalletRequest) returns (WalletResponse);
+
+  // Fake backup archive listing (believable names, sizes).
+  rpc ListBackups(BackupListRequest) returns (stream BackupMetadata);
+
+  // "Download" a backup — an endless junk-data tarpit to waste attacker time.
+  rpc DownloadBackup(BackupDownloadRequest) returns (stream BackupChunk);
+}
+
+message WalletRequest {
+  string wallet_id = 1;
+}
+
+message WalletResponse {
+  string address = 1;
+  string balance = 2;
+  string currency = 3;
+}
+
+message BackupListRequest {}
+
+message BackupMetadata {
+  string name = 1;
+  uint64 size_bytes = 2;
+  string created_at = 3;
+}
+
+message BackupDownloadRequest {
+  string name = 1;
+  // Attacker-requested size in MB; clamped server-side to a tarpit cap.
+  uint32 size_mb = 2;
+}
+
+message BackupChunk {
+  bytes data = 1;
+}

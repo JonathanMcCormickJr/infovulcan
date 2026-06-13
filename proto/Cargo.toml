@@ -7,11 +7,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tonic = "0.14"
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 prost = "0.14"
 prost-types = "0.14"
 tonic-prost = "0.14"
+anyhow = "1.0"
+serde_json = "1.0"
+# Post-quantum KEM (Kyber-768) for the app-layer wire wrap.
+shared = { path = "../shared" }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14"
+
+[dev-dependencies]
+rcgen = "0.14"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "time"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tempfile = "3.23"

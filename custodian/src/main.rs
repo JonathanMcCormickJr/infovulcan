@@ -219,27 +219,33 @@ async fn main() -> Result<()> {
     // Parse address
     let addr = parse_listen_addr(&listen_addr)?;
 
-    // Create gRPC service; optionally connect to DB leader
-    let db_client = maybe_connect_db(std::env::var("DB_LEADER_ADDR").ok()).await;
+    // Ticket persistence requires the DB service, so DB_LEADER_ADDR is a hard
+    // startup requirement: fail fast rather than silently dropping ticket writes.
+    let db_endpoint = std::env::var("DB_LEADER_ADDR").map_err(|_| {
+        anyhow::anyhow!(
+            "DB_LEADER_ADDR is required (e.g. http://[::1]:50051) — the custodian persists \
+             tickets to the DB service and will not start without it"
+        )
+    })?;
+    let db_client = maybe_connect_db(Some(db_endpoint)).await.ok_or_else(|| {
+        anyhow::anyhow!("failed to connect to DB_LEADER_ADDR — is the DB service running?")
+    })?;
 
-    if db_client.is_none() {
-        tracing::warn!(
-            "DB_LEADER_ADDR not set or connection failed — tickets will NOT be persisted to the database. \
-             Set DB_LEADER_ADDR=http://<db-host>:<port> for full functionality."
-        );
-    }
-
-    let custodian_service = if let Some(db) = db_client {
-        CustodianServiceImpl::with_db_client((*raft).clone(), storage.clone(), db, keys)
-    } else {
-        CustodianServiceImpl::new((*raft).clone(), storage.clone(), keys)
-    };
+    let custodian_service =
+        CustodianServiceImpl::with_db_client((*raft).clone(), storage.clone(), db_client, keys);
 
     info!("Starting gRPC server on {}", addr);
 
+    // Serve the inter-node Raft service alongside the public custodian service, so peers
+    // can actually replicate in a multi-node cluster (without this, only single-node works).
+    let raft_service = custodian::raft_service::RaftServiceImpl::new(raft.clone());
+
     // Start gRPC server
-    Server::builder()
+    proto::tls::apply_server_tls(Server::builder())?
         .add_service(create_server(custodian_service))
+        .add_service(
+            custodian::server::custodian::raft_service_server::RaftServiceServer::new(raft_service),
+        )
         .serve(addr)
         .await?;
 

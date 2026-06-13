@@ -1,0 +1,9 @@
+# services.toml baked into the lbrp unikernel image (mapped to /etc/infovulcan/services.toml).
+# Production endpoints use mTLS, so https:// + the DNS name in each service certificate's SAN.
+# LBRP reloads this file every SERVICES_RELOAD_SECS and hot-reconnects changed backends.
+
+[services]
+auth = "https://auth:8082"
+admin = "https://admin:8083"
+custodian = "https://custodian-leader:8081"
+db = "https://db-1:50051"

@@ -87,18 +87,13 @@ impl DbNetwork {
         openraft::error::NetworkError,
     > {
         if self.client.is_none() {
-            match crate::server::db::raft_service_client::RaftServiceClient::connect(
-                self.address.clone(),
-            )
-            .await
-            {
-                Ok(client) => {
-                    self.client = Some(client);
-                }
-                Err(e) => {
-                    return Err(openraft::error::NetworkError::new(&e));
-                }
-            }
+            // Apply client mTLS if configured (otherwise plaintext); `proto::tls` rewrites
+            // http:// -> https:// when TLS is on.
+            let channel = proto::tls::connect(&self.address).await.map_err(|e| {
+                openraft::error::NetworkError::new(&std::io::Error::other(e.to_string()))
+            })?;
+            self.client =
+                Some(crate::server::db::raft_service_client::RaftServiceClient::new(channel));
         }
         // Client should be initialized above, but handle gracefully
         self.client.as_mut().ok_or_else(|| {
@@ -241,13 +236,41 @@ impl RaftNetwork<DbTypeConfig> for DbNetwork {
             let resp = response.into_inner();
 
             // Convert back to OpenRaft types
-            let _proto_vote = resp.vote.ok_or_else(|| {
+            let proto_vote = resp.vote.ok_or_else(|| {
                 openraft::error::RPCError::Network(openraft::error::NetworkError::new(
                     &std::io::Error::new(std::io::ErrorKind::InvalidData, "missing vote"),
                 ))
             })?;
 
-            let append_response = openraft::raft::AppendEntriesResponse::Success;
+            // Decode the typed response: 0=Success, 1=PartialSuccess, 2=Conflict, 3=HigherVote.
+            let append_response = match resp.response_type {
+                0 => openraft::raft::AppendEntriesResponse::Success,
+                1 => openraft::raft::AppendEntriesResponse::PartialSuccess(
+                    resp.partial_success_index.map(|log_id| openraft::LogId {
+                        leader_id: openraft::LeaderId {
+                            term: log_id.term,
+                            node_id: proto_vote.node_id,
+                        },
+                        index: log_id.index,
+                    }),
+                ),
+                2 => openraft::raft::AppendEntriesResponse::Conflict,
+                3 => openraft::raft::AppendEntriesResponse::HigherVote(openraft::Vote {
+                    leader_id: openraft::LeaderId {
+                        term: proto_vote.term,
+                        node_id: proto_vote.node_id,
+                    },
+                    committed: proto_vote.committed,
+                }),
+                other => {
+                    return Err(openraft::error::RPCError::Network(
+                        openraft::error::NetworkError::new(&std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown append_entries response_type: {other}"),
+                        )),
+                    ));
+                }
+            };
 
             Ok(append_response)
         }
@@ -289,8 +312,7 @@ impl RaftNetwork<DbTypeConfig> for DbNetwork {
                         .meta
                         .last_membership
                         .log_id()
-                        .map(|log_id| log_id.index)
-                        .unwrap_or(0),
+                        .map_or(0, |log_id| log_id.index),
                 )
                 .unwrap_or(u32::MAX),
                 snapshot_id: snapshot.meta.snapshot_id,
@@ -381,8 +403,7 @@ impl RaftNetwork<DbTypeConfig> for DbNetwork {
                         rpc.meta
                             .last_membership
                             .log_id()
-                            .map(|log_id| log_id.index)
-                            .unwrap_or(0),
+                            .map_or(0, |log_id| log_id.index),
                     )
                     .unwrap_or(u32::MAX),
                     snapshot_id: rpc.meta.snapshot_id,
@@ -438,12 +459,16 @@ mod tests {
     #[derive(Clone)]
     struct TestRaftSvc {
         missing_vote: Arc<RwLock<bool>>,
+        /// `AppendEntries` `response_type` to return (0=Success, 1=PartialSuccess, 2=Conflict,
+        /// 3=HigherVote, anything else exercises the unknown-type decode error path).
+        append_response_type: Arc<RwLock<u32>>,
     }
 
     impl TestRaftSvc {
         fn new() -> Self {
             Self {
                 missing_vote: Arc::new(RwLock::new(false)),
+                append_response_type: Arc::new(RwLock::new(0)),
             }
         }
     }
@@ -478,6 +503,7 @@ mod tests {
         ) -> Result<Response<AppendEntriesResponse>, Status> {
             let req = request.into_inner();
             let missing_vote = *self.missing_vote.read().await;
+            let response_type = *self.append_response_type.read().await;
 
             Ok(Response::new(AppendEntriesResponse {
                 vote: if missing_vote {
@@ -489,8 +515,13 @@ mod tests {
                         committed: true,
                     })
                 },
-                response_type: 0,
-                partial_success_index: None,
+                response_type,
+                // PartialSuccess (type 1) carries an index; other types leave it None.
+                partial_success_index: if response_type == 1 {
+                    Some(crate::server::db::ProtoLogId { term: 1, index: 7 })
+                } else {
+                    None
+                },
             }))
         }
 
@@ -791,6 +822,61 @@ mod tests {
                 .await
                 .is_ok()
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_decodes_all_response_variants() {
+        // Fault-injection: the peer returns each non-Success response_type so the client-side
+        // decode of PartialSuccess / Conflict / HigherVote / unknown is exercised.
+        let svc = TestRaftSvc::new();
+        let server = start_test_server("127.0.0.1:50063", svc.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut peers = HashMap::new();
+        peers.insert(1, "http://127.0.0.1:50063".to_string());
+        let mut factory = DbNetworkFactory::with_peers(peers);
+        let mut client = factory.new_client(1, &openraft::BasicNode::default()).await;
+
+        let make_req = || openraft::raft::AppendEntriesRequest {
+            vote: openraft::Vote {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                committed: true,
+            },
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        };
+        let opt = || openraft::network::RPCOption::new(Duration::from_secs(1));
+
+        // 1 = PartialSuccess(Some(log_id))
+        *svc.append_response_type.write().await = 1;
+        let r = client.append_entries(make_req(), opt()).await.unwrap();
+        assert!(matches!(
+            r,
+            openraft::raft::AppendEntriesResponse::PartialSuccess(Some(_))
+        ));
+
+        // 2 = Conflict
+        *svc.append_response_type.write().await = 2;
+        let r = client.append_entries(make_req(), opt()).await.unwrap();
+        assert!(matches!(r, openraft::raft::AppendEntriesResponse::Conflict));
+
+        // 3 = HigherVote
+        *svc.append_response_type.write().await = 3;
+        let r = client.append_entries(make_req(), opt()).await.unwrap();
+        assert!(matches!(
+            r,
+            openraft::raft::AppendEntriesResponse::HigherVote(_)
+        ));
+
+        // anything else = decode error
+        *svc.append_response_type.write().await = 99;
+        assert!(client.append_entries(make_req(), opt()).await.is_err());
 
         server.abort();
     }

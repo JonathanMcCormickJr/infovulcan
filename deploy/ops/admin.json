@@ -1,0 +1,23 @@
+{
+  "_comment": "NanoVMs OPS image config for the InfoVulcan admin service (stateless; user/role mgmt, intrusion audit log). Hardened topology only. UNVALIDATED template — see deploy/README.md.",
+  "Args": [],
+  "Env": {
+    "LISTEN_ADDR": "0.0.0.0:8083",
+    "DB_ADDR": "https://db-1:50051",
+    "STORAGE_PATH": "/data/admin-keys",
+    "TLS_CA_CERT": "/etc/infovulcan/certs/ca.crt",
+    "TLS_CERT": "/etc/infovulcan/certs/admin.crt",
+    "TLS_KEY": "/etc/infovulcan/certs/admin.key",
+    "TLS_DOMAIN": "admin",
+    "RUST_LOG": "info"
+  },
+  "Dirs": ["data"],
+  "MapDirs": {
+    "/etc/infovulcan/certs": "./certs/admin"
+  },
+  "RunConfig": {
+    "Ports": ["8083"],
+    "Memory": "256m"
+  },
+  "BaseVolumeSz": "512m"
+}

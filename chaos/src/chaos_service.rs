@@ -5,7 +5,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
 pub use proto::chaos;
@@ -13,10 +16,20 @@ pub use proto::chaos;
 use chaos::chaos_service_server::ChaosService;
 use chaos::{ChaosAck, ChaosRequest, ListRequest, ScenarioCatalog, StopRequest};
 
-/// Chaos service implementation
+/// An injected scenario that is currently *active*: the parsed fault plus the background task
+/// that auto-expires it after its configured duration.
+#[derive(Debug)]
+struct ActiveScenario {
+    #[allow(dead_code)]
+    scenario: ChaosScenario,
+    expiry_task: JoinHandle<()>,
+}
+
+/// Chaos service implementation.
 #[derive(Debug, Default)]
 pub struct ChaosServiceImpl {
-    active_scenarios: Arc<RwLock<HashMap<String, ChaosScenario>>>,
+    active_scenarios: Arc<RwLock<HashMap<String, ActiveScenario>>>,
+    next_id: Arc<AtomicU64>,
 }
 
 /// Chaos scenario types
@@ -48,7 +61,44 @@ pub enum ChaosScenario {
     },
 }
 
+impl ChaosScenario {
+    /// How long this scenario stays active before it auto-expires.
+    fn duration_ms(&self) -> u64 {
+        match self {
+            Self::NetworkLatency { duration_ms, .. }
+            | Self::ServiceCrash { duration_ms, .. }
+            | Self::DiskIODelay { duration_ms, .. }
+            | Self::RaftLeaderFailure { duration_ms, .. }
+            | Self::NetworkPartition { duration_ms, .. } => *duration_ms,
+        }
+    }
+}
+
 impl ChaosServiceImpl {
+    /// Admin authentication for mutating operations. If `CHAOS_AUTH_TOKEN` is set, the request
+    /// must carry a matching `x-chaos-token` metadata header. If it is unset, access is open
+    /// (dev/test default) — chaos is meant to run only in non-production environments.
+    fn check_auth<T>(request: &Request<T>) -> Result<(), Status> {
+        let expected = std::env::var("CHAOS_AUTH_TOKEN").ok();
+        let provided = request
+            .metadata()
+            .get("x-chaos-token")
+            .and_then(|v| v.to_str().ok());
+        Self::authorize(expected.as_deref(), provided)
+    }
+
+    /// Pure authorization decision: open when no token is configured, otherwise the provided
+    /// token must match exactly.
+    fn authorize(expected: Option<&str>, provided: Option<&str>) -> Result<(), Status> {
+        match expected {
+            None => Ok(()),
+            Some(exp) if provided == Some(exp) => Ok(()),
+            Some(_) => Err(Status::permission_denied(
+                "chaos: missing or invalid admin token",
+            )),
+        }
+    }
+
     /// Parses a [`ChaosRequest`] into a typed [`ChaosScenario`].
     fn parse_scenario(req: &ChaosRequest) -> Result<ChaosScenario, Status> {
         let p = &req.parameters;
@@ -119,17 +169,33 @@ impl ChaosService for ChaosServiceImpl {
         &self,
         request: Request<ChaosRequest>,
     ) -> Result<Response<ChaosAck>, Status> {
+        Self::check_auth(&request)?;
         let req = request.into_inner();
         let scenario = Self::parse_scenario(&req)?;
 
-        // Store the active scenario.
-        let scenario_id = format!("{}_{}", req.scenario_type, chrono::Utc::now().timestamp());
-        self.active_scenarios
-            .write()
-            .await
-            .insert(scenario_id.clone(), scenario);
+        // Unique, deterministic id (a per-second timestamp collides under rapid injection).
+        let seq = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let scenario_id = format!("{}_{seq}", req.scenario_type);
 
-        // In a full implementation this would spawn background tasks to apply the fault.
+        // Apply the scenario as a live, time-bounded fault: spawn a task that keeps it active
+        // for its configured duration and then auto-expires it.
+        let duration = Duration::from_millis(scenario.duration_ms());
+        let scenarios = self.active_scenarios.clone();
+        let id_for_task = scenario_id.clone();
+        let expiry_task = tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            scenarios.write().await.remove(&id_for_task);
+            tracing::info!(id = %id_for_task, "chaos scenario expired");
+        });
+
+        self.active_scenarios.write().await.insert(
+            scenario_id.clone(),
+            ActiveScenario {
+                scenario,
+                expiry_task,
+            },
+        );
+
         tracing::info!(scenario_type = %req.scenario_type, id = %scenario_id, "chaos scenario injected");
 
         Ok(Response::new(ChaosAck {
@@ -143,16 +209,13 @@ impl ChaosService for ChaosServiceImpl {
         &self,
         request: Request<StopRequest>,
     ) -> Result<Response<ChaosAck>, Status> {
+        Self::check_auth(&request)?;
         let req = request.into_inner();
 
-        if self
-            .active_scenarios
-            .write()
-            .await
-            .remove(&req.scenario_id)
-            .is_some()
-        {
-            println!("Stopped chaos scenario: {}", req.scenario_id);
+        if let Some(active) = self.active_scenarios.write().await.remove(&req.scenario_id) {
+            // Cancel the pending auto-expiry task; the fault is being stopped early.
+            active.expiry_task.abort();
+            tracing::info!(id = %req.scenario_id, "chaos scenario stopped");
             Ok(Response::new(ChaosAck {
                 scenario_id: req.scenario_id,
                 status: "stopped".to_string(),
@@ -212,6 +275,59 @@ mod tests {
         assert!(ack.scenario_id.starts_with("network_latency_"));
         assert_eq!(ack.status, "injected");
         assert!(ack.message.contains("network_latency"));
+    }
+
+    #[test]
+    fn authorize_open_when_unconfigured_else_requires_matching_token() {
+        // No token configured -> open.
+        assert!(ChaosServiceImpl::authorize(None, None).is_ok());
+        assert!(ChaosServiceImpl::authorize(None, Some("anything")).is_ok());
+        // Token configured -> must match.
+        assert!(ChaosServiceImpl::authorize(Some("secret"), Some("secret")).is_ok());
+        assert_eq!(
+            ChaosServiceImpl::authorize(Some("secret"), Some("wrong"))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            ChaosServiceImpl::authorize(Some("secret"), None)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_scenario_auto_expires_after_its_duration() {
+        let service = ChaosServiceImpl::default();
+        let request = Request::new(ChaosRequest {
+            scenario_type: "network_latency".to_string(),
+            parameters: vec![("duration_ms".to_string(), "50".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        service.inject_scenario(request).await.unwrap();
+
+        // Active immediately after injection.
+        let active = service
+            .list_scenarios(Request::new(ListRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(active.scenario_ids.len(), 1);
+
+        // After its 50ms lifetime, the background task auto-expires it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after = service
+            .list_scenarios(Request::new(ListRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            after.scenario_ids.is_empty(),
+            "scenario should have auto-expired"
+        );
     }
 
     #[tokio::test]

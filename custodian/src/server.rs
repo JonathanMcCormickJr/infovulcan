@@ -10,13 +10,22 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 pub use proto::custodian;
+use proto::db;
 
 use custodian::custodian_service_server::{CustodianService, CustodianServiceServer};
 use custodian::{
     CreateTicketRequest, GetTicketRequest, HealthRequest, HealthResponse, LockRelease, LockRequest,
-    LockResponse as ProtoLockResponse, Ticket, UpdateTicketRequest,
+    LockResponse as ProtoLockResponse, QueryTicketsRequest, Ticket, UpdateTicketRequest,
 };
 use shared::ticket as domain;
+
+/// Lock time-to-live in seconds, from `LOCK_TTL_SECS` (default 900 = 15 min; `0` = never expires).
+fn lock_ttl_secs() -> i64 {
+    std::env::var("LOCK_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900)
+}
 
 // Expose metrics endpoint via gRPC is handled elsewhere; ensure metrics module is initialized
 #[allow(dead_code)]
@@ -74,25 +83,61 @@ impl CustodianServiceImpl {
         prost_types::Timestamp::from(std::time::SystemTime::from(dt))
     }
 
-    /// Map a domain [`NextAction`] to the corresponding protobuf `NextAction` integer.
+    /// Map a domain [`NextAction`] to the protobuf `NextAction` message (lossless).
     ///
-    /// The domain type carries rich scheduling data (timestamps, auto-close schedules)
-    /// that the current protobuf enum cannot represent. The mapping is best-effort:
-    /// - `None` → `NEXT_ACTION_UNSPECIFIED`
-    /// - `FollowUp(_)` → `CONTACT_CUSTOMER` (follow-ups typically involve customer contact)
-    /// - `Appointment(_)` → `DIAGNOSE_ISSUE` (appointments are typically on-site visits)
-    /// - `AutoClose(_)` → `CLOSE_TICKET`
-    ///
-    /// The scheduling timestamp is not preserved. A future proto revision should add an
-    /// optional `next_action_scheduled_at` timestamp field to carry this information.
-    fn map_next_action(next_action: &domain::NextAction) -> i32 {
-        match next_action {
-            domain::NextAction::FollowUp(_) => custodian::NextAction::ContactCustomer as i32,
-            domain::NextAction::Appointment(_) => custodian::NextAction::DiagnoseIssue as i32,
-            domain::NextAction::AutoClose(_) => custodian::NextAction::CloseTicket as i32,
-            // Non-exhaustive enum: None and any future variants are treated as unspecified
-            _ => custodian::NextAction::Unspecified as i32,
+    /// `None` maps to an absent message; the other variants carry their scheduling data
+    /// (timestamp or auto-close schedule) explicitly.
+    fn map_next_action(next_action: &domain::NextAction) -> Option<custodian::NextAction> {
+        use custodian::next_action::Kind;
+        let kind = match next_action {
+            domain::NextAction::FollowUp(ts) => Kind::FollowUp(Self::dt_to_proto(*ts)),
+            domain::NextAction::Appointment(ts) => Kind::Appointment(Self::dt_to_proto(*ts)),
+            domain::NextAction::AutoClose(schedule) => {
+                Kind::AutoClose(Self::auto_close_to_proto(*schedule) as i32)
+            }
+            // `None` and any future (non-exhaustive) variant map to an absent message.
+            _ => return None,
+        };
+        Some(custodian::NextAction { kind: Some(kind) })
+    }
+
+    /// Map a protobuf `NextAction` message back to the domain type (lossless inverse).
+    fn proto_to_next_action(next_action: &custodian::NextAction) -> domain::NextAction {
+        use custodian::next_action::Kind;
+        match &next_action.kind {
+            Some(Kind::FollowUp(ts)) => domain::NextAction::FollowUp(Self::proto_to_dt(ts)),
+            Some(Kind::Appointment(ts)) => domain::NextAction::Appointment(Self::proto_to_dt(ts)),
+            Some(Kind::AutoClose(v)) => {
+                domain::NextAction::AutoClose(Self::proto_to_auto_close(*v))
+            }
+            None => domain::NextAction::None,
         }
+    }
+
+    fn auto_close_to_proto(schedule: domain::AutoCloseSchedule) -> custodian::AutoCloseSchedule {
+        match schedule {
+            domain::AutoCloseSchedule::Hours24 => custodian::AutoCloseSchedule::Hours24,
+            domain::AutoCloseSchedule::Hours48 => custodian::AutoCloseSchedule::Hours48,
+            domain::AutoCloseSchedule::Hours72 => custodian::AutoCloseSchedule::Hours72,
+            // EndOfDay and any future variant.
+            _ => custodian::AutoCloseSchedule::EndOfDay,
+        }
+    }
+
+    fn proto_to_auto_close(value: i32) -> domain::AutoCloseSchedule {
+        match custodian::AutoCloseSchedule::try_from(value) {
+            Ok(custodian::AutoCloseSchedule::Hours24) => domain::AutoCloseSchedule::Hours24,
+            Ok(custodian::AutoCloseSchedule::Hours48) => domain::AutoCloseSchedule::Hours48,
+            Ok(custodian::AutoCloseSchedule::Hours72) => domain::AutoCloseSchedule::Hours72,
+            // EndOfDay / Unspecified / unknown.
+            _ => domain::AutoCloseSchedule::EndOfDay,
+        }
+    }
+
+    /// Convert a [`prost_types::Timestamp`] back to a [`chrono::DateTime<Utc>`].
+    fn proto_to_dt(ts: &prost_types::Timestamp) -> chrono::DateTime<chrono::Utc> {
+        let nanos = u32::try_from(ts.nanos).unwrap_or(0);
+        chrono::DateTime::from_timestamp(ts.seconds, nanos).unwrap_or_default()
     }
 
     /// Convert a domain [`HistoryEntry`] to the corresponding protobuf message.
@@ -303,6 +348,45 @@ impl CustodianServiceImpl {
             schema_version: ticket.schema_version,
         }
     }
+
+    /// Serialize and encrypt a domain ticket into an opaque body for the DB.
+    fn encrypt_ticket(&self, ticket: &domain::Ticket) -> Result<Vec<u8>, Status> {
+        let ticket_bytes = serde_json::to_vec(ticket)
+            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+        let encrypted = EncryptionService::encrypt_with_public_key(&ticket_bytes, &self.keypair.0)
+            .map_err(|e| Status::internal(format!("encryption error: {e}")))?;
+        serde_json::to_vec(&encrypted)
+            .map_err(|e| Status::internal(format!("serialize encrypted data error: {e}")))
+    }
+
+    /// Decrypt and deserialize a ticket body, re-stamping the id from the DB record.
+    ///
+    /// The encrypted body is the source of truth for ticket *contents*, but the id is
+    /// owned by the DB (which assigns it), so we always re-stamp it from the record.
+    fn decrypt_ticket(&self, ticket_id: u64, body: &[u8]) -> Result<domain::Ticket, Status> {
+        let encrypted_data: shared::encryption::EncryptedData = serde_json::from_slice(body)
+            .map_err(|e| Status::internal(format!("deserialize encrypted data error: {e}")))?;
+        let decrypted =
+            EncryptionService::decrypt_with_private_key(&encrypted_data, &self.keypair.1)
+                .map_err(|e| Status::internal(format!("decryption error: {e}")))?;
+        let mut ticket: domain::Ticket = serde_json::from_slice(&decrypted)
+            .map_err(|e| Status::internal(format!("deserialize ticket error: {e}")))?;
+        ticket.ticket_id = ticket_id;
+        Ok(ticket)
+    }
+
+    /// Derive the DB's plaintext index fields from a domain ticket.
+    fn ticket_index(ticket: &domain::Ticket) -> db::TicketIndexFields {
+        db::TicketIndexFields {
+            status: ticket.status as u32,
+            account_uuid: ticket.account_uuid.to_string(),
+            assigned_to_uuid: ticket.assigned_to.map(|u| u.to_string()),
+            project: ticket.project.clone(),
+            tracking_url: ticket.tracking_url.clone(),
+            created_at_unix: ticket.created_at.timestamp(),
+            updated_at_unix: ticket.updated_at.timestamp(),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -313,39 +397,61 @@ impl CustodianService for CustodianServiceImpl {
     ) -> Result<Response<Ticket>, Status> {
         let req = request.into_inner();
 
-        if let Some(client) = &self.db_client {
+        let Some(client) = &self.db_client else {
+            return Err(Status::unavailable("no db client configured"));
+        };
+        let record = {
             let mut client = client.lock().await;
-            let key = req.ticket_id.to_be_bytes().to_vec();
-
-            match client
-                .get("ticket", key)
+            client
+                .get_ticket(req.ticket_id, false)
                 .await
                 .map_err(|e| Status::internal(format!("db get error: {e}")))?
-            {
-                Some(bytes) => {
-                    // Decrypt
-                    let encrypted_data: shared::encryption::EncryptedData =
-                        serde_json::from_slice(&bytes).map_err(|e| {
-                            Status::internal(format!("deserialize encrypted data error: {e}"))
-                        })?;
-
-                    let decrypted_bytes = EncryptionService::decrypt_with_private_key(
-                        &encrypted_data,
-                        &self.keypair.1,
-                    )
-                    .map_err(|e| Status::internal(format!("decryption error: {e}")))?;
-
-                    // Deserialize domain object
-                    let ticket: domain::Ticket = serde_json::from_slice(&decrypted_bytes)
-                        .map_err(|e| Status::internal(format!("deserialize ticket error: {e}")))?;
-
-                    Ok(Response::new(Self::domain_to_proto(&ticket)))
-                }
-                None => Err(Status::not_found("ticket not found")),
+        };
+        match record {
+            Some(record) => {
+                let ticket = self.decrypt_ticket(record.ticket_id, &record.encrypted_body)?;
+                Ok(Response::new(Self::domain_to_proto(&ticket)))
             }
-        } else {
-            Err(Status::unavailable("no db client configured"))
+            None => Err(Status::not_found("ticket not found")),
         }
+    }
+
+    type QueryTicketsStream = tokio_stream::Iter<std::vec::IntoIter<Result<Ticket, Status>>>;
+
+    async fn query_tickets(
+        &self,
+        request: Request<QueryTicketsRequest>,
+    ) -> Result<Response<Self::QueryTicketsStream>, Status> {
+        let req = request.into_inner();
+
+        let Some(client) = &self.db_client else {
+            return Err(Status::unavailable("no db client configured"));
+        };
+
+        let query = db::TicketQuery {
+            status: req.status,
+            assigned_to_uuid: req.assigned_to_uuid,
+            account_uuid: req.account_uuid,
+            project: req.project,
+            include_deleted: req.include_deleted,
+            limit: req.limit,
+        };
+
+        let records = {
+            let mut lock = client.lock().await;
+            lock.query_tickets(query)
+                .await
+                .map_err(|e| Status::internal(format!("db query_tickets error: {e}")))?
+        };
+
+        // Decrypt each record into a proto ticket; a single decryption failure fails the stream.
+        let mut tickets: Vec<Result<Ticket, Status>> = Vec::with_capacity(records.len());
+        for record in records {
+            let ticket = self.decrypt_ticket(record.ticket_id, &record.encrypted_body)?;
+            tickets.push(Ok(Self::domain_to_proto(&ticket)));
+        }
+
+        Ok(Response::new(tokio_stream::iter(tickets)))
     }
 
     async fn create_ticket(
@@ -359,24 +465,18 @@ impl CustodianService for CustodianServiceImpl {
             return Err(Status::invalid_argument("title is required"));
         }
 
-        // Generate ticket id (millisecond timestamp)
-        let ticket_id: u64 = chrono::Utc::now()
-            .timestamp_millis()
-            .try_into()
-            .unwrap_or_default();
-
         let account_uuid = Uuid::parse_str(&req.account_uuid)
             .map_err(|_| Status::invalid_argument("Invalid account UUID"))?;
 
         let created_by_uuid = Uuid::parse_str(&req.created_by_uuid)
             .map_err(|_| Status::invalid_argument("Invalid created_by UUID"))?;
 
-        // Create domain ticket
+        // Create domain ticket. The id is assigned by the DB (0 = placeholder until then).
         let symptom = domain::Symptom::from_u8(u8::try_from(req.symptom).unwrap_or(0));
         let priority = domain::TicketPriority::from_u8(u8::try_from(req.priority).unwrap_or(0));
 
         let mut ticket = domain::Ticket::new(
-            ticket_id,
+            0,
             req.title,
             req.project,
             account_uuid,
@@ -392,24 +492,23 @@ impl CustodianService for CustodianServiceImpl {
         ticket.ebond = req.ebond;
         ticket.tracking_url = req.tracking_url;
 
-        // Serialize and Encrypt
-        let ticket_bytes = serde_json::to_vec(&ticket)
-            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+        let encrypted_bytes = self.encrypt_ticket(&ticket)?;
+        let index = Self::ticket_index(&ticket);
 
-        let encrypted = EncryptionService::encrypt_with_public_key(&ticket_bytes, &self.keypair.0)
-            .map_err(|e| Status::internal(format!("encryption error: {e}")))?;
-
-        let encrypted_bytes = serde_json::to_vec(&encrypted)
-            .map_err(|e| Status::internal(format!("serialize encrypted data error: {e}")))?;
-
-        // Persist to DB if client available
-        if let Some(client) = &self.db_client {
+        // Persist via the DB's CreateTicket (which assigns the id). Without a DB client
+        // configured, fall back to a local id so the response is still well-formed.
+        let ticket_id = if let Some(client) = &self.db_client {
             let mut lock = client.lock().await;
-            let key = ticket_id.to_be_bytes().to_vec();
-            lock.put("ticket", key, encrypted_bytes)
+            lock.create_ticket(encrypted_bytes, index)
                 .await
-                .map_err(|e| Status::internal(format!("db put error: {e}")))?;
-        }
+                .map_err(|e| Status::internal(format!("db create_ticket error: {e}")))?
+        } else {
+            chrono::Utc::now()
+                .timestamp_millis()
+                .try_into()
+                .unwrap_or_default()
+        };
+        ticket.ticket_id = ticket_id;
 
         Ok(Response::new(Self::domain_to_proto(&ticket)))
     }
@@ -426,15 +525,28 @@ impl CustodianService for CustodianServiceImpl {
         let command = LockCommand::AcquireLock {
             ticket_id: req.ticket_id,
             user_id,
+            at_unix: chrono::Utc::now().timestamp(),
+            ttl_secs: lock_ttl_secs(),
         };
 
         // Submit to Raft for consensus
         match self.raft.client_write(command).await {
             Ok(response) => {
+                // On failure, report who currently holds the lock so the caller can
+                // see why their acquisition was rejected.
+                let current_holder = if response.data.success {
+                    None
+                } else {
+                    self.storage
+                        .get_lock_info(req.ticket_id)
+                        .ok()
+                        .flatten()
+                        .map(|lock| lock.user_id.to_string())
+                };
                 let proto_response = ProtoLockResponse {
                     success: response.data.success,
                     error: response.data.error.unwrap_or_default(),
-                    current_holder: None, // TODO: Get current holder if lock failed
+                    current_holder,
                 };
                 Ok(Response::new(proto_response))
             }
@@ -484,12 +596,16 @@ impl CustodianService for CustodianServiceImpl {
         let updater = Uuid::parse_str(updater_str)
             .map_err(|_| Status::invalid_argument("Invalid updated_by_uuid"))?;
 
-        // Check lock ownership
+        // Check lock ownership. An expired lock is treated as not held (the updater must
+        // re-acquire), so updates after auto-expiry are rejected.
         match self
             .storage
             .get_lock_info(req.ticket_id)
             .map_err(|e| Status::internal(format!("storage error: {e}")))?
         {
+            Some(lock) if lock.is_expired(chrono::Utc::now().timestamp()) => {
+                return Err(Status::permission_denied("ticket lock has expired"));
+            }
             Some(lock) => {
                 if lock.user_id != updater {
                     return Err(Status::permission_denied("user does not hold lock"));
@@ -499,35 +615,18 @@ impl CustodianService for CustodianServiceImpl {
         }
 
         // Fetch ticket from DB
-        let mut ticket: domain::Ticket = if let Some(client) = &self.db_client {
-            let mut client = client.lock().await;
-            let key = req.ticket_id.to_be_bytes().to_vec();
-            match client
-                .get("ticket", key)
+        let Some(client) = &self.db_client else {
+            return Err(Status::unavailable("no db client configured"));
+        };
+        let record = {
+            let mut lock = client.lock().await;
+            lock.get_ticket(req.ticket_id, false)
                 .await
                 .map_err(|e| Status::internal(format!("db get error: {e}")))?
-            {
-                Some(bytes) => {
-                    // Decrypt
-                    let encrypted_data: shared::encryption::EncryptedData =
-                        serde_json::from_slice(&bytes).map_err(|e| {
-                            Status::internal(format!("deserialize encrypted data error: {e}"))
-                        })?;
-
-                    let decrypted_bytes = EncryptionService::decrypt_with_private_key(
-                        &encrypted_data,
-                        &self.keypair.1,
-                    )
-                    .map_err(|e| Status::internal(format!("decryption error: {e}")))?;
-
-                    let ticket: domain::Ticket = serde_json::from_slice(&decrypted_bytes)
-                        .map_err(|e| Status::internal(format!("deserialize ticket error: {e}")))?;
-                    ticket
-                }
-                None => return Err(Status::not_found("ticket not found")),
-            }
-        } else {
-            return Err(Status::unavailable("no db client configured"));
+        };
+        let mut ticket = match record {
+            Some(record) => self.decrypt_ticket(record.ticket_id, &record.encrypted_body)?,
+            None => return Err(Status::not_found("ticket not found")),
         };
 
         // Apply updates from request (only update provided fields)
@@ -544,14 +643,18 @@ impl CustodianService for CustodianServiceImpl {
             ticket.priority = domain::TicketPriority::from_u8(u8::try_from(priority).unwrap_or(0));
         }
         if let Some(status_val) = req.status {
-            ticket.status = domain::TicketStatus::from_u8(u8::try_from(status_val).unwrap_or(0));
+            let new_status = domain::TicketStatus::from_u8(u8::try_from(status_val).unwrap_or(0));
+            // Policy-as-code: reject status changes that violate the ticket lifecycle.
+            if !ticket.status.can_transition_to(new_status) {
+                return Err(Status::failed_precondition(format!(
+                    "invalid status transition: {:?} -> {new_status:?}",
+                    ticket.status
+                )));
+            }
+            ticket.status = new_status;
         }
         if let Some(next_action) = req.next_action {
-            // TODO: Map NextAction properly. For now, if unspecified (0), we leave it.
-            // If specified, we map to None because we don't have data.
-            if next_action != 0 {
-                ticket.next_action = domain::NextAction::None;
-            }
+            ticket.next_action = Self::proto_to_next_action(&next_action);
         }
         if let Some(resolution) = req.resolution {
             ticket.resolution = Some(domain::Resolution::from_u8(
@@ -568,24 +671,14 @@ impl CustodianService for CustodianServiceImpl {
         ticket.updated_by = updater;
         ticket.updated_at = chrono::Utc::now();
 
-        // Serialize and Encrypt
-        let ticket_bytes = serde_json::to_vec(&ticket)
-            .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+        let encrypted_bytes = self.encrypt_ticket(&ticket)?;
+        let index = Self::ticket_index(&ticket);
 
-        let encrypted = EncryptionService::encrypt_with_public_key(&ticket_bytes, &self.keypair.0)
-            .map_err(|e| Status::internal(format!("encryption error: {e}")))?;
-
-        let encrypted_bytes = serde_json::to_vec(&encrypted)
-            .map_err(|e| Status::internal(format!("serialize encrypted data error: {e}")))?;
-
-        // Persist updated ticket
-        if let Some(client) = &self.db_client {
-            let mut client = client.lock().await;
-            let key = req.ticket_id.to_be_bytes().to_vec();
-            client
-                .put("ticket", key, encrypted_bytes)
+        {
+            let mut lock = client.lock().await;
+            lock.update_ticket(req.ticket_id, encrypted_bytes, index)
                 .await
-                .map_err(|e| Status::internal(format!("db put error: {e}")))?;
+                .map_err(|e| Status::internal(format!("db update_ticket error: {e}")))?;
         }
 
         Ok(Response::new(Self::domain_to_proto(&ticket)))
@@ -761,6 +854,53 @@ mod tests {
             .await
             .expect("release");
         assert!(release_resp.get_ref().success);
+    }
+
+    #[tokio::test]
+    async fn acquire_lock_conflict_reports_current_holder() {
+        let store = crate::raft::CustodianStore::new_temp().unwrap();
+        let storage = store.storage().clone();
+        let cfg = Arc::new(Config::default().validate().unwrap());
+        let network_factory = crate::network::CustodianNetworkFactory::new();
+        let (log_store, state_machine) = Adaptor::new(store.clone());
+        let raft =
+            crate::raft::CustodianRaft::new(1u64, cfg, network_factory, log_store, state_machine)
+                .await
+                .expect("create raft");
+        let mut members = std::collections::BTreeSet::new();
+        members.insert(1u64);
+        let _ = raft.initialize(members).await;
+        let svc = CustodianServiceImpl::new(
+            raft.clone(),
+            storage.clone(),
+            (vec![0; 1184], vec![0; 2400]),
+        );
+
+        let holder = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        let ticket_id = 42;
+
+        let first = svc
+            .acquire_lock(Request::new(custodian::LockRequest {
+                ticket_id,
+                user_uuid: holder.clone(),
+            }))
+            .await
+            .expect("first acquire")
+            .into_inner();
+        assert!(first.success);
+
+        // A different user's acquisition is rejected and learns who holds the lock.
+        let second = svc
+            .acquire_lock(Request::new(custodian::LockRequest {
+                ticket_id,
+                user_uuid: other,
+            }))
+            .await
+            .expect("second acquire")
+            .into_inner();
+        assert!(!second.success);
+        assert_eq!(second.current_holder.as_deref(), Some(holder.as_str()));
     }
 
     #[test]
@@ -991,36 +1131,59 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
-    // ── map_next_action ───────────────────────────────────────────────────────
+    // ── NextAction lossless round-trip (domain -> proto -> domain) ──────────────
 
-    #[test]
-    fn map_next_action_none_maps_to_unspecified() {
-        let result = CustodianServiceImpl::map_next_action(&domain::NextAction::None);
-        assert_eq!(result, custodian::NextAction::Unspecified as i32);
+    fn next_action_roundtrip(na: &domain::NextAction) -> domain::NextAction {
+        match CustodianServiceImpl::map_next_action(na) {
+            Some(proto) => CustodianServiceImpl::proto_to_next_action(&proto),
+            None => {
+                CustodianServiceImpl::proto_to_next_action(&custodian::NextAction { kind: None })
+            }
+        }
     }
 
     #[test]
-    fn map_next_action_follow_up_maps_to_contact_customer() {
-        let result = CustodianServiceImpl::map_next_action(&domain::NextAction::FollowUp(
-            chrono::Utc::now(),
-        ));
-        assert_eq!(result, custodian::NextAction::ContactCustomer as i32);
+    fn next_action_none_roundtrips() {
+        assert_eq!(
+            next_action_roundtrip(&domain::NextAction::None),
+            domain::NextAction::None
+        );
+        // None maps to an absent proto message.
+        assert!(CustodianServiceImpl::map_next_action(&domain::NextAction::None).is_none());
     }
 
     #[test]
-    fn map_next_action_appointment_maps_to_diagnose_issue() {
-        let result = CustodianServiceImpl::map_next_action(&domain::NextAction::Appointment(
-            chrono::Utc::now(),
-        ));
-        assert_eq!(result, custodian::NextAction::DiagnoseIssue as i32);
+    fn next_action_follow_up_roundtrips_with_timestamp() {
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        assert_eq!(
+            next_action_roundtrip(&domain::NextAction::FollowUp(ts)),
+            domain::NextAction::FollowUp(ts)
+        );
     }
 
     #[test]
-    fn map_next_action_auto_close_maps_to_close_ticket() {
-        let result = CustodianServiceImpl::map_next_action(&domain::NextAction::AutoClose(
+    fn next_action_appointment_roundtrips_with_timestamp() {
+        let ts = chrono::DateTime::from_timestamp(1_700_000_500, 0).unwrap();
+        assert_eq!(
+            next_action_roundtrip(&domain::NextAction::Appointment(ts)),
+            domain::NextAction::Appointment(ts)
+        );
+    }
+
+    #[test]
+    fn next_action_auto_close_roundtrips_each_schedule() {
+        for schedule in [
+            domain::AutoCloseSchedule::EndOfDay,
             domain::AutoCloseSchedule::Hours24,
-        ));
-        assert_eq!(result, custodian::NextAction::CloseTicket as i32);
+            domain::AutoCloseSchedule::Hours48,
+            domain::AutoCloseSchedule::Hours72,
+        ] {
+            assert_eq!(
+                next_action_roundtrip(&domain::NextAction::AutoClose(schedule)),
+                domain::NextAction::AutoClose(schedule),
+                "auto-close schedule {schedule:?} should round-trip"
+            );
+        }
     }
 
     // ── map_history_entry ─────────────────────────────────────────────────────
@@ -1210,7 +1373,8 @@ mod tests {
             domain::Symptom::BroadbandDown,
             owner,
         );
-        ticket.next_action = domain::NextAction::FollowUp(chrono::Utc::now());
+        let follow_up_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        ticket.next_action = domain::NextAction::FollowUp(follow_up_at);
         ticket.history.push(domain::HistoryEntry {
             timestamp: chrono::Utc::now(),
             user_id: owner,
@@ -1219,9 +1383,12 @@ mod tests {
             new_value: Some("Closed".to_string()),
         });
         let proto = CustodianServiceImpl::domain_to_proto(&ticket);
+        // next_action is now a structured message carrying the timestamp losslessly.
         assert_eq!(
-            proto.next_action,
-            custodian::NextAction::ContactCustomer as i32
+            CustodianServiceImpl::proto_to_next_action(
+                proto.next_action.as_ref().expect("next_action present")
+            ),
+            domain::NextAction::FollowUp(follow_up_at)
         );
         assert_eq!(proto.history.len(), 1);
         assert_eq!(proto.history[0].action, "status");

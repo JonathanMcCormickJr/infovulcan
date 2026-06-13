@@ -5,17 +5,60 @@
 //! direct storage access (reads).
 
 use crate::raft::DbRaft;
-use crate::storage::{LogEntry, Storage};
+use crate::storage::{self, LogEntry, Storage};
 use tonic::{Request, Response, Status};
 
 pub use proto::db;
 
 use db::database_server::Database;
 use db::{
-    BatchPutRequest, BatchPutResponse, ClusterStatusRequest, ClusterStatusResponse, DeleteRequest,
-    DeleteResponse, ExistsRequest, ExistsResponse, GetRequest, GetResponse, HealthRequest,
-    HealthResponse, KeyValue, ListRequest, ListResponse, PutRequest, PutResponse,
+    BatchPutRequest, BatchPutResponse, ClusterStatusRequest, ClusterStatusResponse, DeleteAck,
+    DeleteRequest, DeleteResponse, ExistsRequest, ExistsResponse, GetRequest, GetResponse,
+    HealthRequest, HealthResponse, KeyValue, ListRequest, ListResponse, PutRequest, PutResponse,
+    TicketLookup, TicketQuery, TicketRecord, TicketWrite, UserLookup, UserRecord, UserWrite,
 };
+
+/// Convert a protobuf ticket index payload into the storage representation.
+fn ticket_index_from_proto(idx: Option<db::TicketIndexFields>) -> storage::TicketIndexFields {
+    let idx = idx.unwrap_or_default();
+    storage::TicketIndexFields {
+        status: u8::try_from(idx.status).unwrap_or(0),
+        account_uuid: idx.account_uuid,
+        assigned_to_uuid: idx.assigned_to_uuid,
+        project: idx.project,
+        tracking_url: idx.tracking_url,
+        created_at_unix: idx.created_at_unix,
+        updated_at_unix: idx.updated_at_unix,
+    }
+}
+
+/// Convert a protobuf user index payload into the storage representation.
+fn user_index_from_proto(idx: Option<db::UserIndexFields>) -> storage::UserIndexFields {
+    let idx = idx.unwrap_or_default();
+    storage::UserIndexFields {
+        username: idx.username,
+        email: idx.email,
+        role: u8::try_from(idx.role).unwrap_or(0),
+    }
+}
+
+fn ticket_record(id: u64, stored: &storage::StoredTicket) -> TicketRecord {
+    TicketRecord {
+        ticket_id: id,
+        encrypted_body: stored.body.clone(),
+        deleted: stored.deleted,
+        deleted_at_unix: stored.deleted_at_unix,
+    }
+}
+
+fn user_record(uuid: String, stored: &storage::StoredUser) -> UserRecord {
+    UserRecord {
+        user_uuid: uuid,
+        encrypted_body: stored.body.clone(),
+        deleted: stored.deleted,
+        deleted_at_unix: stored.deleted_at_unix,
+    }
+}
 
 /// Database service implementation
 ///
@@ -37,6 +80,211 @@ impl DatabaseService {
 
 #[tonic::async_trait]
 impl Database for DatabaseService {
+    // ---- Domain RPCs: tickets ----
+
+    async fn create_ticket(
+        &self,
+        request: Request<TicketWrite>,
+    ) -> Result<Response<TicketRecord>, Status> {
+        let req = request.into_inner();
+        let entry = LogEntry::CreateTicket {
+            body: req.encrypted_body.clone(),
+            index: ticket_index_from_proto(req.index),
+        };
+        let resp = self
+            .raft
+            .client_write(entry)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+
+        // CreateTicket returns the assigned id (big-endian) in the response value.
+        let id = resp
+            .data
+            .value
+            .as_deref()
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| Status::internal("create_ticket did not return an id"))?;
+
+        Ok(Response::new(TicketRecord {
+            ticket_id: id,
+            encrypted_body: req.encrypted_body,
+            deleted: false,
+            deleted_at_unix: 0,
+        }))
+    }
+
+    async fn get_ticket(
+        &self,
+        request: Request<TicketLookup>,
+    ) -> Result<Response<TicketRecord>, Status> {
+        let req = request.into_inner();
+        match self
+            .storage
+            .get_ticket(req.ticket_id, req.include_deleted)
+            .map_err(|e| Status::internal(format!("Storage read failed: {e}")))?
+        {
+            Some(stored) => Ok(Response::new(ticket_record(req.ticket_id, &stored))),
+            None => Err(Status::not_found("ticket not found")),
+        }
+    }
+
+    async fn update_ticket(
+        &self,
+        request: Request<TicketWrite>,
+    ) -> Result<Response<TicketRecord>, Status> {
+        let req = request.into_inner();
+        if req.ticket_id == 0 {
+            return Err(Status::invalid_argument(
+                "update_ticket requires a ticket_id",
+            ));
+        }
+        let entry = LogEntry::UpdateTicket {
+            ticket_id: req.ticket_id,
+            body: req.encrypted_body.clone(),
+            index: ticket_index_from_proto(req.index),
+        };
+        self.raft
+            .client_write(entry)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+
+        // Re-read so the returned record reflects persisted soft-delete state.
+        match self
+            .storage
+            .get_ticket(req.ticket_id, true)
+            .map_err(|e| Status::internal(format!("Storage read failed: {e}")))?
+        {
+            Some(stored) => Ok(Response::new(ticket_record(req.ticket_id, &stored))),
+            None => Err(Status::not_found("ticket not found")),
+        }
+    }
+
+    async fn soft_delete_ticket(
+        &self,
+        request: Request<TicketLookup>,
+    ) -> Result<Response<DeleteAck>, Status> {
+        let req = request.into_inner();
+        let entry = LogEntry::SoftDeleteTicket {
+            ticket_id: req.ticket_id,
+            at_unix: chrono::Utc::now().timestamp(),
+        };
+        self.raft
+            .client_write(entry)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+        Ok(Response::new(DeleteAck { success: true }))
+    }
+
+    type QueryTicketsStream = tokio_stream::Iter<std::vec::IntoIter<Result<TicketRecord, Status>>>;
+
+    async fn query_tickets(
+        &self,
+        request: Request<TicketQuery>,
+    ) -> Result<Response<Self::QueryTicketsStream>, Status> {
+        let req = request.into_inner();
+        let query = storage::TicketQuery {
+            status: req.status.and_then(|s| u8::try_from(s).ok()),
+            assigned_to_uuid: req.assigned_to_uuid,
+            account_uuid: req.account_uuid,
+            project: req.project,
+            include_deleted: req.include_deleted,
+            limit: req.limit as usize,
+        };
+        let records: Vec<Result<TicketRecord, Status>> = self
+            .storage
+            .query_tickets(&query)
+            .map_err(|e| Status::internal(format!("Storage query failed: {e}")))?
+            .into_iter()
+            .map(|(id, stored)| Ok(ticket_record(id, &stored)))
+            .collect();
+        Ok(Response::new(tokio_stream::iter(records)))
+    }
+
+    // ---- Domain RPCs: users ----
+
+    async fn create_user(
+        &self,
+        request: Request<UserWrite>,
+    ) -> Result<Response<UserRecord>, Status> {
+        let req = request.into_inner();
+        if req.user_uuid.is_empty() {
+            return Err(Status::invalid_argument("create_user requires a user_uuid"));
+        }
+        let entry = LogEntry::CreateUser {
+            user_uuid: req.user_uuid.clone(),
+            body: req.encrypted_body.clone(),
+            index: user_index_from_proto(req.index),
+        };
+        self.raft
+            .client_write(entry)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+        Ok(Response::new(UserRecord {
+            user_uuid: req.user_uuid,
+            encrypted_body: req.encrypted_body,
+            deleted: false,
+            deleted_at_unix: 0,
+        }))
+    }
+
+    async fn get_user(&self, request: Request<UserLookup>) -> Result<Response<UserRecord>, Status> {
+        let req = request.into_inner();
+        match self
+            .storage
+            .get_user(&req.user_uuid, req.include_deleted)
+            .map_err(|e| Status::internal(format!("Storage read failed: {e}")))?
+        {
+            Some(stored) => Ok(Response::new(user_record(req.user_uuid, &stored))),
+            None => Err(Status::not_found("user not found")),
+        }
+    }
+
+    async fn update_user(
+        &self,
+        request: Request<UserWrite>,
+    ) -> Result<Response<UserRecord>, Status> {
+        let req = request.into_inner();
+        if req.user_uuid.is_empty() {
+            return Err(Status::invalid_argument("update_user requires a user_uuid"));
+        }
+        let entry = LogEntry::UpdateUser {
+            user_uuid: req.user_uuid.clone(),
+            body: req.encrypted_body.clone(),
+            index: user_index_from_proto(req.index),
+        };
+        self.raft
+            .client_write(entry)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+        match self
+            .storage
+            .get_user(&req.user_uuid, true)
+            .map_err(|e| Status::internal(format!("Storage read failed: {e}")))?
+        {
+            Some(stored) => Ok(Response::new(user_record(req.user_uuid, &stored))),
+            None => Err(Status::not_found("user not found")),
+        }
+    }
+
+    async fn soft_delete_user(
+        &self,
+        request: Request<UserLookup>,
+    ) -> Result<Response<DeleteAck>, Status> {
+        let req = request.into_inner();
+        let entry = LogEntry::SoftDeleteUser {
+            user_uuid: req.user_uuid,
+            at_unix: chrono::Utc::now().timestamp(),
+        };
+        self.raft
+            .client_write(entry)
+            .await
+            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+        Ok(Response::new(DeleteAck { success: true }))
+    }
+
+    // ---- Generic KV ----
+
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
@@ -317,6 +565,168 @@ mod tests {
             .expect("get deleted")
             .into_inner();
         assert!(!get_deleted.found);
+    }
+
+    fn sample_proto_index(status: u32) -> db::TicketIndexFields {
+        db::TicketIndexFields {
+            status,
+            account_uuid: "acct".to_string(),
+            assigned_to_uuid: Some("agent".to_string()),
+            project: "proj".to_string(),
+            tracking_url: None,
+            created_at_unix: 1,
+            updated_at_unix: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_then_get_ticket_roundtrip() {
+        let svc = create_service().await;
+
+        let created = svc
+            .create_ticket(Request::new(TicketWrite {
+                ticket_id: 0,
+                encrypted_body: b"cipher".to_vec(),
+                index: Some(sample_proto_index(1)),
+            }))
+            .await
+            .expect("create")
+            .into_inner();
+        assert_eq!(created.ticket_id, 1);
+
+        let got = svc
+            .get_ticket(Request::new(TicketLookup {
+                ticket_id: created.ticket_id,
+                include_deleted: false,
+            }))
+            .await
+            .expect("get")
+            .into_inner();
+        assert_eq!(got.encrypted_body, b"cipher");
+        assert!(!got.deleted);
+    }
+
+    #[tokio::test]
+    async fn query_streams_matching_tickets() {
+        use tokio_stream::StreamExt;
+        let svc = create_service().await;
+
+        let open = svc
+            .create_ticket(Request::new(TicketWrite {
+                ticket_id: 0,
+                encrypted_body: b"a".to_vec(),
+                index: Some(sample_proto_index(1)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let _closed = svc
+            .create_ticket(Request::new(TicketWrite {
+                ticket_id: 0,
+                encrypted_body: b"b".to_vec(),
+                index: Some(sample_proto_index(9)),
+            }))
+            .await
+            .unwrap();
+
+        let stream = svc
+            .query_tickets(Request::new(TicketQuery {
+                status: Some(1),
+                assigned_to_uuid: None,
+                account_uuid: None,
+                project: None,
+                include_deleted: false,
+                limit: 0,
+            }))
+            .await
+            .expect("query")
+            .into_inner();
+        let results: Vec<_> = stream.collect::<Vec<_>>().await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().ticket_id, open.ticket_id);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_hides_ticket_unless_include_deleted() {
+        let svc = create_service().await;
+        let created = svc
+            .create_ticket(Request::new(TicketWrite {
+                ticket_id: 0,
+                encrypted_body: b"x".to_vec(),
+                index: Some(sample_proto_index(1)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        svc.soft_delete_ticket(Request::new(TicketLookup {
+            ticket_id: created.ticket_id,
+            include_deleted: false,
+        }))
+        .await
+        .expect("soft delete");
+
+        // Hidden from a normal read…
+        assert!(
+            svc.get_ticket(Request::new(TicketLookup {
+                ticket_id: created.ticket_id,
+                include_deleted: false,
+            }))
+            .await
+            .is_err()
+        );
+        // …but the audit row is retained.
+        let got = svc
+            .get_ticket(Request::new(TicketLookup {
+                ticket_id: created.ticket_id,
+                include_deleted: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.deleted);
+    }
+
+    #[tokio::test]
+    async fn create_then_get_user_roundtrip_and_soft_delete() {
+        let svc = create_service().await;
+        let idx = db::UserIndexFields {
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            role: 2,
+        };
+        svc.create_user(Request::new(UserWrite {
+            user_uuid: "u-1".to_string(),
+            encrypted_body: b"ubody".to_vec(),
+            index: Some(idx),
+        }))
+        .await
+        .expect("create user");
+
+        let got = svc
+            .get_user(Request::new(UserLookup {
+                user_uuid: "u-1".to_string(),
+                include_deleted: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.encrypted_body, b"ubody");
+
+        svc.soft_delete_user(Request::new(UserLookup {
+            user_uuid: "u-1".to_string(),
+            include_deleted: false,
+        }))
+        .await
+        .expect("soft delete user");
+        assert!(
+            svc.get_user(Request::new(UserLookup {
+                user_uuid: "u-1".to_string(),
+                include_deleted: false,
+            }))
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

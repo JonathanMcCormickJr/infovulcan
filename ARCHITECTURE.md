@@ -1352,12 +1352,29 @@ Common conventions:
 - `rpc UpdateTicket(UpdateTicketRequest) returns (UpdateTicketResponse)`
 - `rpc StreamTicketUpdates(StreamTicketUpdatesRequest) returns (stream TicketUpdate)`
 
-#### DbService
-- `rpc AppendTicket(DbTicketWrite) returns (DbTicketRecord)`
-- `rpc GetTicket(DbTicketLookup) returns (DbTicketRecord)`
-- `rpc SoftDeleteTicket(DbTicketLookup) returns (DeleteAck)`
-- `rpc QueryTickets(DbQuery) returns (stream DbTicketRecord)`
-- `rpc ManageUser(DbUserCommand) returns (DbUserRecord)`
+#### DbService (`Database`)
+
+The DB uses a **hybrid storage model**: each ticket/user is stored as an opaque,
+custodian-encrypted `encrypted_body` plus a small set of *plaintext* index fields
+(`TicketIndexFields` / `UserIndexFields`) that the DB uses to maintain secondary
+indexes and answer `QueryTickets` filters. The DB never decrypts the body.
+
+Ticket RPCs:
+- `rpc CreateTicket(TicketWrite) returns (TicketRecord)` — DB assigns the id
+- `rpc GetTicket(TicketLookup) returns (TicketRecord)`
+- `rpc UpdateTicket(TicketWrite) returns (TicketRecord)`
+- `rpc SoftDeleteTicket(TicketLookup) returns (DeleteAck)`
+- `rpc QueryTickets(TicketQuery) returns (stream TicketRecord)`
+
+User RPCs:
+- `rpc CreateUser(UserWrite) returns (UserRecord)`
+- `rpc GetUser(UserLookup) returns (UserRecord)`
+- `rpc UpdateUser(UserWrite) returns (UserRecord)`
+- `rpc SoftDeleteUser(UserLookup) returns (DeleteAck)`
+
+> The generic KV RPCs (`Put`/`Get`/`Delete`/`List`/`Exists`/`BatchPut`) are
+> retained on the same service for collections without a domain schema (sessions,
+> audit) used by `auth`/`admin`. Migrating those off generic KV is a tracked follow-up.
 
 #### AuthService
 - `rpc AuthenticatePassword(PasswordLogin) returns (LoginResponse)`

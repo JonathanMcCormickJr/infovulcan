@@ -2,31 +2,127 @@ syntax = "proto3";
 
 package db;
 
-// Database service for distributed key-value storage with Raft consensus
+// Database service for distributed storage with Raft consensus.
+//
+// Domain RPCs (CreateTicket/GetTicket/... and the user equivalents) are the
+// primary, ARCHITECTURE.md-aligned API. They use the hybrid storage model:
+// an opaque, custodian-encrypted `encrypted_body` plus plaintext index fields
+// the DB uses to maintain secondary indexes and answer QueryTickets filters.
+//
+// The generic KV RPCs (Put/Get/Delete/List/Exists/BatchPut) are retained for
+// collections without a domain schema (sessions, audit) used by auth/admin.
+// Retiring them fully is tracked as a follow-up.
 service Database {
+  // ---- Domain RPCs: tickets ----
+  rpc CreateTicket(TicketWrite) returns (TicketRecord);
+  rpc GetTicket(TicketLookup) returns (TicketRecord);
+  rpc UpdateTicket(TicketWrite) returns (TicketRecord);
+  rpc SoftDeleteTicket(TicketLookup) returns (DeleteAck);
+  rpc QueryTickets(TicketQuery) returns (stream TicketRecord);
+
+  // ---- Domain RPCs: users ----
+  rpc CreateUser(UserWrite) returns (UserRecord);
+  rpc GetUser(UserLookup) returns (UserRecord);
+  rpc UpdateUser(UserWrite) returns (UserRecord);
+  rpc SoftDeleteUser(UserLookup) returns (DeleteAck);
+
+  // ---- Generic KV (sessions/audit; auth & admin) ----
   // Store a key-value pair (goes through Raft leader)
   rpc Put(PutRequest) returns (PutResponse);
-  
+
   // Retrieve a value by key (can read from any node)
   rpc Get(GetRequest) returns (GetResponse);
-  
+
   // Delete a key (goes through Raft leader)
   rpc Delete(DeleteRequest) returns (DeleteResponse);
-  
+
   // List keys with optional prefix filter
   rpc List(ListRequest) returns (ListResponse);
-  
+
   // Check if key exists
   rpc Exists(ExistsRequest) returns (ExistsResponse);
-  
+
   // Batch operations
   rpc BatchPut(BatchPutRequest) returns (BatchPutResponse);
-  
+
   // Health check
   rpc Health(HealthRequest) returns (HealthResponse);
-  
+
   // Get cluster status (leader, followers, etc.)
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+}
+
+// ============================================================================
+// Domain messages (hybrid model: encrypted body + plaintext index fields)
+// ============================================================================
+
+// Plaintext, indexable fields extracted from a ticket by the custodian.
+message TicketIndexFields {
+  uint32 status = 1;                    // domain TicketStatus repr(u8)
+  string account_uuid = 2;
+  optional string assigned_to_uuid = 3;
+  string project = 4;
+  optional string tracking_url = 5;
+  int64 created_at_unix = 6;
+  int64 updated_at_unix = 7;
+}
+
+// Create (ticket_id = 0) or update (ticket_id > 0) a ticket.
+message TicketWrite {
+  uint64 ticket_id = 1;
+  bytes encrypted_body = 2;
+  TicketIndexFields index = 3;
+}
+
+message TicketRecord {
+  uint64 ticket_id = 1;
+  bytes encrypted_body = 2;
+  bool deleted = 3;
+  int64 deleted_at_unix = 4;
+}
+
+message TicketLookup {
+  uint64 ticket_id = 1;
+  bool include_deleted = 2;
+}
+
+// Filter for QueryTickets. Set fields are ANDed; unset means "any".
+message TicketQuery {
+  optional uint32 status = 1;
+  optional string assigned_to_uuid = 2;
+  optional string account_uuid = 3;
+  optional string project = 4;
+  bool include_deleted = 5;
+  uint32 limit = 6;                     // 0 = unlimited
+}
+
+message DeleteAck {
+  bool success = 1;
+}
+
+// Plaintext, indexable fields extracted from a user.
+message UserIndexFields {
+  string username = 1;
+  string email = 2;
+  uint32 role = 3;                      // domain Role repr(u8)
+}
+
+message UserWrite {
+  string user_uuid = 1;
+  bytes encrypted_body = 2;
+  UserIndexFields index = 3;
+}
+
+message UserRecord {
+  string user_uuid = 1;
+  bytes encrypted_body = 2;
+  bool deleted = 3;
+  int64 deleted_at_unix = 4;
+}
+
+message UserLookup {
+  string user_uuid = 1;
+  bool include_deleted = 2;
 }
 
 // Raft consensus service for inter-node communication

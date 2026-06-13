@@ -14,6 +14,40 @@ use crate::server::db::{
     ProtoLogId, ProtoVote, VoteRequest, VoteResponse, raft_service_server::RaftService,
 };
 
+/// Encode an openraft [`openraft::raft::AppendEntriesResponse`] into the wire triple
+/// `(response_type, partial_success_index, vote)`.
+///
+/// Wire encoding: `0`=success, `1`=partial-success, `2`=conflict, `3`=higher-vote.
+/// For every variant except higher-vote the responder echoes the leader's vote;
+/// higher-vote carries the responder's strictly-greater vote that caused the rejection.
+fn encode_append_response(
+    resp: &openraft::raft::AppendEntriesResponse<u64>,
+    echoed_vote: ProtoVote,
+) -> (u32, Option<ProtoLogId>, ProtoVote) {
+    use openraft::raft::AppendEntriesResponse as Aer;
+    match resp {
+        Aer::Success => (0, None, echoed_vote),
+        Aer::PartialSuccess(matching) => (
+            1,
+            matching.as_ref().map(|log_id| ProtoLogId {
+                term: log_id.leader_id.term,
+                index: log_id.index,
+            }),
+            echoed_vote,
+        ),
+        Aer::Conflict => (2, None, echoed_vote),
+        Aer::HigherVote(higher) => (
+            3,
+            None,
+            ProtoVote {
+                term: higher.leader_id.term,
+                node_id: higher.leader_id.node_id,
+                committed: higher.committed,
+            },
+        ),
+    }
+}
+
 /// Implementation of the Raft service
 pub struct RaftServiceImpl {
     /// Reference to the Raft instance
@@ -130,21 +164,26 @@ impl RaftService for RaftServiceImpl {
         };
 
         // Forward to Raft
-        let _raft_response = self
+        let raft_response = self
             .raft
             .append_entries(append_req)
             .await
             .map_err(|e| Status::internal(format!("append_entries failed: {e}")))?;
 
-        // Convert back to proto
+        // Map the openraft response into the typed wire response so the leader can
+        // distinguish success / partial-success / log-conflict / higher-vote rejection.
+        let echoed_vote = ProtoVote {
+            term: proto_vote.term,
+            node_id: proto_vote.node_id,
+            committed: proto_vote.committed,
+        };
+        let (response_type, partial_success_index, vote) =
+            encode_append_response(&raft_response, echoed_vote);
+
         let proto_response = AppendEntriesResponse {
-            vote: Some(ProtoVote {
-                term: proto_vote.term,
-                node_id: proto_vote.node_id,
-                committed: proto_vote.committed,
-            }),
-            response_type: 0, // Success - TODO: handle different response types
-            partial_success_index: None,
+            vote: Some(vote),
+            response_type,
+            partial_success_index,
         };
 
         Ok(Response::new(proto_response))
@@ -230,6 +269,65 @@ mod tests {
     use crate::storage::LogEntry;
     use openraft::storage::Adaptor;
     use tonic::Request;
+
+    fn sample_vote() -> ProtoVote {
+        ProtoVote {
+            term: 7,
+            node_id: 2,
+            committed: true,
+        }
+    }
+
+    #[test]
+    fn encode_append_response_success() {
+        use openraft::raft::AppendEntriesResponse as Aer;
+        let (rt, idx, vote) = encode_append_response(&Aer::Success, sample_vote());
+        assert_eq!(rt, 0);
+        assert!(idx.is_none());
+        assert_eq!(vote.term, 7);
+    }
+
+    #[test]
+    fn encode_append_response_partial_success_carries_index() {
+        use openraft::raft::AppendEntriesResponse as Aer;
+        let log_id = openraft::LogId {
+            leader_id: openraft::LeaderId {
+                term: 4,
+                node_id: 1,
+            },
+            index: 11,
+        };
+        let (rt, idx, _) =
+            encode_append_response(&Aer::PartialSuccess(Some(log_id)), sample_vote());
+        assert_eq!(rt, 1);
+        let idx = idx.expect("partial success carries an index");
+        assert_eq!((idx.term, idx.index), (4, 11));
+    }
+
+    #[test]
+    fn encode_append_response_conflict() {
+        use openraft::raft::AppendEntriesResponse as Aer;
+        let (rt, idx, _) = encode_append_response(&Aer::Conflict, sample_vote());
+        assert_eq!(rt, 2);
+        assert!(idx.is_none());
+    }
+
+    #[test]
+    fn encode_append_response_higher_vote_reports_responder_vote() {
+        use openraft::raft::AppendEntriesResponse as Aer;
+        let higher = openraft::Vote {
+            leader_id: openraft::LeaderId {
+                term: 99,
+                node_id: 5,
+            },
+            committed: false,
+        };
+        let (rt, idx, vote) = encode_append_response(&Aer::HigherVote(higher), sample_vote());
+        assert_eq!(rt, 3);
+        assert!(idx.is_none());
+        // The responder's higher vote is reported, not the echoed leader vote.
+        assert_eq!((vote.term, vote.node_id), (99, 5));
+    }
 
     async fn test_service() -> RaftServiceImpl {
         let store = DbStore::new_temp().expect("temp store");
@@ -355,7 +453,10 @@ mod tests {
             .expect("append entries should succeed");
 
         let body = response.into_inner();
-        assert_eq!(body.response_type, 0);
+        // The exact class (Success/PartialSuccess/Conflict/HigherVote) depends on the
+        // node's current vote/log state; assert the handler returns a valid typed response.
+        // (Previously this was hardcoded to 0 regardless of the real Raft outcome.)
+        assert!(body.response_type <= 3);
         assert!(body.vote.is_some());
     }
 

@@ -15,9 +15,9 @@ pub use proto::{admin, db};
 
 use admin::{
     CreateUserRequest, CreateUserResponse, DeleteUserRequest, DeleteUserResponse, GetUserRequest,
-    GetUserResponse, ListUsersRequest, ListUsersResponse, MetricsSnapshot, PushAck,
-    Role as ProtoRole, UpdateUserRequest, UpdateUserResponse, User as ProtoUser,
-    admin_service_server::AdminService,
+    GetUserResponse, IntrusionAck, IntrusionEvent, ListUsersRequest, ListUsersResponse,
+    MetricsSnapshot, PushAck, Role as ProtoRole, UpdateUserRequest, UpdateUserResponse,
+    User as ProtoUser, admin_service_server::AdminService,
 };
 
 use chrono::Utc;
@@ -58,6 +58,107 @@ impl AdminServiceImpl {
             Role::EbondPartner => ProtoRole::EbondPartner,
             Role::ReadOnly => ProtoRole::ReadOnly,
         }
+    }
+
+    /// Storage key for a user profile: the raw 16-byte UUID. This must match how
+    /// `create_user` stores it (and how the auth service looks up profiles).
+    fn user_key(id: &str) -> Result<Vec<u8>, Status> {
+        Uuid::parse_str(id)
+            .map(|u| u.as_bytes().to_vec())
+            .map_err(|_| Status::invalid_argument("invalid user id"))
+    }
+
+    fn user_to_proto(user: &User) -> ProtoUser {
+        ProtoUser {
+            id: user.user_id.to_string(),
+            username: user.username.clone(),
+            email: user.email.clone(),
+            display_name: user.display_name.clone(),
+            role: Self::map_proto_role(user.role) as i32,
+            active: user.is_active,
+            created_at: u64::try_from(user.created_at.timestamp()).unwrap_or(0),
+        }
+    }
+
+    /// Decrypt a stored (encrypted) user profile blob into a [`User`].
+    fn decrypt_user(&self, value: &[u8]) -> Result<User, Status> {
+        let encrypted_data: shared::encryption::EncryptedData = serde_json::from_slice(value)
+            .map_err(|e| Status::internal(format!("Failed to decode encrypted data: {e}")))?;
+        let decrypted =
+            EncryptionService::decrypt_with_private_key(&encrypted_data, &self.encryption_keys.1)
+                .map_err(|e| Status::internal(format!("Decryption failed: {e}")))?;
+        serde_json::from_slice(&decrypted)
+            .map_err(|e| Status::internal(format!("Failed to decode User: {e}")))
+    }
+
+    /// Serialize + encrypt a user profile for storage.
+    fn encrypt_user(&self, user: &User) -> Result<Vec<u8>, Status> {
+        let bytes = serde_json::to_vec(user)
+            .map_err(|e| Status::internal(format!("Serialization error: {e}")))?;
+        let encrypted = EncryptionService::encrypt_with_public_key(&bytes, &self.encryption_keys.0)
+            .map_err(|e| Status::internal(format!("Encryption error: {e}")))?;
+        serde_json::to_vec(&encrypted)
+            .map_err(|e| Status::internal(format!("Serialization error: {e}")))
+    }
+
+    /// Re-hash and persist a user's password, preserving any existing MFA enrollment.
+    async fn update_password(
+        &self,
+        client: &mut DatabaseClient<tonic::transport::Channel>,
+        username: &str,
+        user_id: Uuid,
+        password: &str,
+    ) -> Result<(), Status> {
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| Status::internal(format!("Failed to hash password: {e}")))?
+            .to_string();
+
+        let auth_key = format!("auth:username:{username}").into_bytes();
+
+        // Preserve existing MFA fields if the auth record already exists.
+        let existing = client
+            .get(GetRequest {
+                collection: "auth".to_string(),
+                key: auth_key.clone(),
+            })
+            .await?
+            .into_inner();
+        let (mfa_secret, mfa_method) = if existing.found {
+            let enc: shared::encryption::EncryptedData = serde_json::from_slice(&existing.value)
+                .map_err(|e| Status::internal(format!("Failed to decode auth: {e}")))?;
+            let dec = EncryptionService::decrypt_with_private_key(&enc, &self.encryption_keys.1)
+                .map_err(|e| Status::internal(format!("Decryption failed: {e}")))?;
+            let prior: UserAuth = serde_json::from_slice(&dec)
+                .map_err(|e| Status::internal(format!("Failed to decode UserAuth: {e}")))?;
+            (prior.mfa_secret, prior.mfa_method)
+        } else {
+            (None, Some(AuthMethod::Password))
+        };
+
+        let auth = UserAuth {
+            user_id,
+            password_hash,
+            mfa_secret,
+            mfa_method,
+        };
+        let auth_bytes = serde_json::to_vec(&auth)
+            .map_err(|e| Status::internal(format!("Serialization error: {e}")))?;
+        let encrypted =
+            EncryptionService::encrypt_with_public_key(&auth_bytes, &self.encryption_keys.0)
+                .map_err(|e| Status::internal(format!("Encryption error: {e}")))?;
+        let encrypted_bytes = serde_json::to_vec(&encrypted)
+            .map_err(|e| Status::internal(format!("Serialization error: {e}")))?;
+
+        client
+            .put(PutRequest {
+                collection: "auth".to_string(),
+                key: auth_key,
+                value: encrypted_bytes,
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -175,7 +276,7 @@ impl AdminService for AdminServiceImpl {
         let resp = client
             .get(GetRequest {
                 collection: "users".to_string(),
-                key: req.id.into_bytes(),
+                key: Self::user_key(&req.id)?,
             })
             .await?;
 
@@ -213,26 +314,140 @@ impl AdminService for AdminServiceImpl {
 
     async fn list_users(
         &self,
-        _request: Request<ListUsersRequest>,
+        request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
-        // TODO: Implement listing with pagination using DB scan
-        Err(Status::unimplemented("ListUsers not yet implemented"))
+        let req = request.into_inner();
+        let mut client = self.db_client.lock().await;
+
+        let items = client
+            .list(db::ListRequest {
+                collection: "users".to_string(),
+                prefix: vec![],
+                limit: 0, // 0 = no cap; pagination is applied in-memory below
+            })
+            .await?
+            .into_inner()
+            .items;
+
+        // Decrypt each stored profile; skip (with a warning) any entry that fails to decode
+        // so one corrupt row can't fail the whole listing.
+        let mut users: Vec<ProtoUser> = Vec::new();
+        for kv in items {
+            match self.decrypt_user(&kv.value) {
+                Ok(user) => users.push(Self::user_to_proto(&user)),
+                Err(e) => tracing::warn!("skipping undecodable user row: {e}"),
+            }
+        }
+        // Stable order so pagination is deterministic.
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+
+        let total_count = u32::try_from(users.len()).unwrap_or(u32::MAX);
+        let page = req.page.max(1);
+        let page_size = if req.page_size == 0 {
+            50
+        } else {
+            req.page_size
+        };
+        let start = ((page - 1).saturating_mul(page_size)) as usize;
+        let paged = users
+            .into_iter()
+            .skip(start)
+            .take(page_size as usize)
+            .collect();
+
+        Ok(Response::new(ListUsersResponse {
+            users: paged,
+            total_count,
+        }))
     }
 
     async fn update_user(
         &self,
-        _request: Request<UpdateUserRequest>,
+        request: Request<UpdateUserRequest>,
     ) -> Result<Response<UpdateUserResponse>, Status> {
-        // TODO: Implement update logic
-        Err(Status::unimplemented("UpdateUser not yet implemented"))
+        let req = request.into_inner();
+        let mut client = self.db_client.lock().await;
+
+        // Load the existing profile.
+        let resp = client
+            .get(GetRequest {
+                collection: "users".to_string(),
+                key: Self::user_key(&req.id)?,
+            })
+            .await?
+            .into_inner();
+        if !resp.found {
+            return Err(Status::not_found("User not found"));
+        }
+        let mut user = self.decrypt_user(&resp.value)?;
+
+        // Apply provided fields only.
+        if let Some(email) = req.email {
+            user.email = email;
+        }
+        if let Some(display_name) = req.display_name {
+            user.display_name = display_name;
+        }
+        if let Some(role) = req.role {
+            user.role = Self::map_role(role);
+        }
+        if let Some(active) = req.active {
+            user.is_active = active;
+        }
+        user.updated_at = Utc::now();
+
+        // Optional password change: re-hash and update the auth record (preserving MFA fields).
+        if let Some(password) = req.password {
+            self.update_password(&mut client, &user.username, user.user_id, &password)
+                .await?;
+        }
+
+        let encrypted_user_bytes = self.encrypt_user(&user)?;
+        client
+            .put(PutRequest {
+                collection: "users".to_string(),
+                key: user.user_id.as_bytes().to_vec(),
+                value: encrypted_user_bytes,
+            })
+            .await?;
+
+        Ok(Response::new(UpdateUserResponse {
+            user: Some(Self::user_to_proto(&user)),
+        }))
     }
 
     async fn delete_user(
         &self,
-        _request: Request<DeleteUserRequest>,
+        request: Request<DeleteUserRequest>,
     ) -> Result<Response<DeleteUserResponse>, Status> {
-        // TODO: Implement soft delete
-        Err(Status::unimplemented("DeleteUser not yet implemented"))
+        let req = request.into_inner();
+        let mut client = self.db_client.lock().await;
+
+        // Soft delete only (audit trail requirement): deactivate, never hard-delete.
+        let resp = client
+            .get(GetRequest {
+                collection: "users".to_string(),
+                key: Self::user_key(&req.id)?,
+            })
+            .await?
+            .into_inner();
+        if !resp.found {
+            return Err(Status::not_found("User not found"));
+        }
+        let mut user = self.decrypt_user(&resp.value)?;
+        user.is_active = false;
+        user.updated_at = Utc::now();
+
+        let encrypted_user_bytes = self.encrypt_user(&user)?;
+        client
+            .put(PutRequest {
+                collection: "users".to_string(),
+                key: user.user_id.as_bytes().to_vec(),
+                value: encrypted_user_bytes,
+            })
+            .await?;
+
+        Ok(Response::new(DeleteUserResponse { success: true }))
     }
 
     async fn push_metrics(
@@ -240,6 +455,43 @@ impl AdminService for AdminServiceImpl {
         _request: Request<MetricsSnapshot>,
     ) -> Result<Response<PushAck>, Status> {
         Ok(Response::new(PushAck { ok: true }))
+    }
+
+    async fn record_intrusion(
+        &self,
+        request: Request<IntrusionEvent>,
+    ) -> Result<Response<IntrusionAck>, Status> {
+        let event = request.into_inner();
+        tracing::warn!(
+            source_ip = %event.source_ip,
+            endpoint = %event.endpoint_accessed,
+            method = %event.request_method,
+            "honeypot intrusion recorded"
+        );
+
+        // Persist to the append-only audit log (best-effort: a logging failure must not break
+        // the honeypot's alert pipeline). Stored as the prost-encoded event.
+        let key = format!(
+            "intrusion:{}:{}:{}",
+            event.timestamp_unix, event.source_ip, event.endpoint_accessed
+        )
+        .into_bytes();
+        let value = prost::Message::encode_to_vec(&event);
+        if let Err(e) = self
+            .db_client
+            .lock()
+            .await
+            .put(PutRequest {
+                collection: "audit".to_string(),
+                key,
+                value,
+            })
+            .await
+        {
+            tracing::error!("failed to persist intrusion event to audit log: {e}");
+        }
+
+        Ok(Response::new(IntrusionAck { recorded: true }))
     }
 }
 
@@ -266,6 +518,64 @@ mod tests {
 
     #[tonic::async_trait]
     impl db::database_server::Database for MockDb {
+        // --- Domain RPC stubs (this mock only exercises generic KV) ---
+        type QueryTicketsStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<db::TicketRecord, tonic::Status>>>;
+        async fn create_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn get_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn update_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn soft_delete_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn query_tickets(
+            &self,
+            _: tonic::Request<db::TicketQuery>,
+        ) -> Result<tonic::Response<Self::QueryTicketsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn create_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn get_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn update_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn soft_delete_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+
         async fn put(
             &self,
             request: tonic::Request<db::PutRequest>,
@@ -311,9 +621,21 @@ mod tests {
 
         async fn list(
             &self,
-            _req: tonic::Request<db::ListRequest>,
+            request: tonic::Request<db::ListRequest>,
         ) -> Result<tonic::Response<db::ListResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("not needed"))
+            let req = request.into_inner();
+            let map = self.values.read().await;
+            let items = map
+                .iter()
+                .filter(|((collection, key), _)| {
+                    collection == &req.collection && key.starts_with(&req.prefix)
+                })
+                .map(|((_, key), value)| db::KeyValue {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect();
+            Ok(tonic::Response::new(db::ListResponse { items }))
         }
 
         async fn exists(
@@ -455,45 +777,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_users_returns_unimplemented() {
-        let svc = make_service();
-        let err = svc
-            .list_users(Request::new(ListUsersRequest {
-                page: 0,
-                page_size: 10,
+    async fn record_intrusion_persists_to_audit_log() {
+        let keys = EncryptionService::generate_keypair().expect("keypair");
+        let store: MockStore = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (addr, shutdown) = start_mock_db(MockDb {
+            values: store.clone(),
+        });
+        let db_client = connect_retry(addr).await;
+        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+
+        let ack = svc
+            .record_intrusion(Request::new(IntrusionEvent {
+                timestamp_unix: 1_700_000_000,
+                source_ip: "203.0.113.7".to_string(),
+                endpoint_accessed: "/wallet/balance".to_string(),
+                request_method: "GET".to_string(),
+                user_agent: Some("sqlmap/1.0".to_string()),
+                ..Default::default()
             }))
             .await
-            .expect_err("should be unimplemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect("record_intrusion")
+            .into_inner();
+        assert!(ack.recorded);
+
+        // The event was written to the audit collection.
+        let map = store.read().await;
+        assert!(
+            map.keys().any(|(collection, _)| collection == "audit"),
+            "intrusion should be persisted to the audit log"
+        );
+        let _ = shutdown.send(());
+    }
+
+    /// Create a user via the service and return its assigned id.
+    async fn seed_user(svc: &AdminServiceImpl, username: &str, role: i32) -> String {
+        svc.create_user(Request::new(CreateUserRequest {
+            username: username.to_string(),
+            password: "secret123".to_string(),
+            email: format!("{username}@example.com"),
+            display_name: username.to_string(),
+            role,
+        }))
+        .await
+        .expect("create_user should succeed")
+        .into_inner()
+        .user
+        .expect("user in response")
+        .id
     }
 
     #[tokio::test]
-    async fn update_user_returns_unimplemented() {
-        let svc = make_service();
+    async fn list_users_returns_created_users_with_pagination() {
+        let keys = EncryptionService::generate_keypair().expect("keypair");
+        let (addr, shutdown) = start_mock_db(MockDb::default());
+        let db_client = connect_retry(addr).await;
+        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+
+        seed_user(&svc, "alice", 0).await;
+        seed_user(&svc, "bob", 3).await;
+        seed_user(&svc, "carol", 5).await;
+
+        let all = svc
+            .list_users(Request::new(ListUsersRequest {
+                page: 0,
+                page_size: 0,
+            }))
+            .await
+            .expect("list_users")
+            .into_inner();
+        assert_eq!(all.total_count, 3);
+        assert_eq!(all.users.len(), 3);
+        // Sorted by username.
+        assert_eq!(all.users[0].username, "alice");
+
+        // Page 2 with size 2 -> only the third user.
+        let page2 = svc
+            .list_users(Request::new(ListUsersRequest {
+                page: 2,
+                page_size: 2,
+            }))
+            .await
+            .expect("list_users page 2")
+            .into_inner();
+        assert_eq!(page2.total_count, 3);
+        assert_eq!(page2.users.len(), 1);
+        assert_eq!(page2.users[0].username, "carol");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn update_user_changes_profile_fields() {
+        let keys = EncryptionService::generate_keypair().expect("keypair");
+        let (addr, shutdown) = start_mock_db(MockDb::default());
+        let db_client = connect_retry(addr).await;
+        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+
+        let id = seed_user(&svc, "dave", 3).await;
+
+        let updated = svc
+            .update_user(Request::new(UpdateUserRequest {
+                id: id.clone(),
+                email: Some("dave2@example.com".to_string()),
+                display_name: Some("Dave Two".to_string()),
+                role: Some(1),
+                active: Some(true),
+                password: Some("newpass456".to_string()),
+            }))
+            .await
+            .expect("update_user")
+            .into_inner()
+            .user
+            .expect("user");
+        assert_eq!(updated.email, "dave2@example.com");
+        assert_eq!(updated.display_name, "Dave Two");
+        assert_eq!(updated.role, 1);
+
+        // Re-reading reflects the change.
+        let fetched = svc
+            .get_user(Request::new(GetUserRequest { id }))
+            .await
+            .expect("get_user")
+            .into_inner()
+            .user
+            .expect("user");
+        assert_eq!(fetched.email, "dave2@example.com");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn update_user_not_found_returns_not_found() {
+        let keys = EncryptionService::generate_keypair().expect("keypair");
+        let (addr, shutdown) = start_mock_db(MockDb::default());
+        let db_client = connect_retry(addr).await;
+        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+
         let err = svc
             .update_user(Request::new(UpdateUserRequest {
-                id: "some-id".to_string(),
-                email: None,
+                id: uuid::Uuid::new_v4().to_string(),
+                email: Some("x@example.com".to_string()),
                 display_name: None,
                 role: None,
                 active: None,
                 password: None,
             }))
             .await
-            .expect_err("should be unimplemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect_err("missing user");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let _ = shutdown.send(());
     }
 
     #[tokio::test]
-    async fn delete_user_returns_unimplemented() {
-        let svc = make_service();
-        let err = svc
-            .delete_user(Request::new(DeleteUserRequest {
-                id: "some-id".to_string(),
-            }))
+    async fn delete_user_soft_deletes() {
+        let keys = EncryptionService::generate_keypair().expect("keypair");
+        let (addr, shutdown) = start_mock_db(MockDb::default());
+        let db_client = connect_retry(addr).await;
+        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+
+        let id = seed_user(&svc, "erin", 3).await;
+
+        let ack = svc
+            .delete_user(Request::new(DeleteUserRequest { id: id.clone() }))
             .await
-            .expect_err("should be unimplemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .expect("delete_user")
+            .into_inner();
+        assert!(ack.success);
+
+        // Soft delete: the row still exists but is inactive (audit trail preserved).
+        let fetched = svc
+            .get_user(Request::new(GetUserRequest { id }))
+            .await
+            .expect("get_user")
+            .into_inner()
+            .user
+            .expect("user");
+        assert!(!fetched.active);
+
+        let _ = shutdown.send(());
     }
 
     // ── create_user / get_user — cover encryption/hashing lines even on DB failure ──
@@ -593,7 +1054,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         // get_user retrieves with key = req.id.into_bytes() which is the UUID string bytes
         map.insert(
-            ("users".to_string(), user_id.to_string().into_bytes()),
+            ("users".to_string(), user_id.as_bytes().to_vec()),
             encrypt_json(&user, &keys.0),
         );
 

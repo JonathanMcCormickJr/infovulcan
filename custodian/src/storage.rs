@@ -16,12 +16,25 @@ pub const TREE_RAFT_METADATA: &str = "raft_metadata";
 pub const TREE_RAFT_STATE: &str = "raft_state";
 pub const TREE_RAFT_LOG: &str = "raft_log";
 
-/// Lock information stored in the database
+/// Lock information stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockInfo {
     pub ticket_id: u64,
     pub user_id: Uuid,
     pub acquired_at: chrono::DateTime<chrono::Utc>,
+    /// Unix-seconds expiry. `0` means the lock never auto-expires.
+    #[serde(default)]
+    pub expires_at_unix: i64,
+}
+
+impl LockInfo {
+    /// Whether this lock has auto-expired as of `now_unix`. A `0` expiry never expires.
+    /// Time is supplied by the caller (not read from the clock) so the Raft state machine
+    /// can evaluate expiry deterministically using the command's timestamp.
+    #[must_use]
+    pub fn is_expired(&self, now_unix: i64) -> bool {
+        self.expires_at_unix != 0 && self.expires_at_unix <= now_unix
+    }
 }
 
 /// Storage layer wrapping Sled
@@ -64,6 +77,24 @@ impl Storage {
     /// Returns an error if the tree cannot be opened.
     pub fn get_tree(&self, name: &str) -> Result<Tree> {
         self.db.open_tree(name).context("failed to open tree")
+    }
+
+    /// Names of all non-Raft state-machine trees. Enumerating (rather than hard-coding)
+    /// keeps snapshot coverage correct as new trees are added.
+    #[must_use]
+    pub fn data_tree_names(&self) -> Vec<String> {
+        let skip: [&[u8]; 4] = [
+            TREE_RAFT_METADATA.as_bytes(),
+            TREE_RAFT_STATE.as_bytes(),
+            TREE_RAFT_LOG.as_bytes(),
+            b"__sled__default",
+        ];
+        self.db
+            .tree_names()
+            .into_iter()
+            .filter(|name| !skip.contains(&name.as_ref()))
+            .map(|name| String::from_utf8_lossy(&name).into_owned())
+            .collect()
     }
 
     /// Store a key-value pair
@@ -142,17 +173,39 @@ impl Storage {
         Ok(tree.contains_key(key)?)
     }
 
-    /// Acquire a lock on a ticket
+    /// Acquire a non-expiring lock at the current wall-clock time. Convenience wrapper used
+    /// by tests and non-Raft paths; the Raft state machine uses [`Storage::acquire_lock_at`].
     ///
     /// # Errors
     ///
     /// Returns an error if the lock cannot be acquired.
     pub fn acquire_lock(&self, ticket_id: u64, user_id: Uuid) -> Result<()> {
+        self.acquire_lock_at(ticket_id, user_id, chrono::Utc::now().timestamp(), 0)
+    }
+
+    /// Acquire a lock with an explicit acquisition time and TTL.
+    ///
+    /// `at_unix` is the acquisition time (unix seconds) and `ttl_secs` the lock lifetime
+    /// (`0` = never expires). Both are supplied by the caller so the Raft state machine
+    /// records identical expiry on every node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock cannot be acquired.
+    pub fn acquire_lock_at(
+        &self,
+        ticket_id: u64,
+        user_id: Uuid,
+        at_unix: i64,
+        ttl_secs: i64,
+    ) -> Result<()> {
         let key = ticket_id.to_be_bytes();
+        let expires_at_unix = if ttl_secs > 0 { at_unix + ttl_secs } else { 0 };
         let lock_info = LockInfo {
             ticket_id,
             user_id,
-            acquired_at: chrono::Utc::now(),
+            acquired_at: chrono::DateTime::from_timestamp(at_unix, 0).unwrap_or_default(),
+            expires_at_unix,
         };
         let value = serde_json::to_vec(&lock_info)?;
         self.put(TREE_LOCKS, &key, &value)
@@ -218,22 +271,39 @@ impl Storage {
     }
 }
 
-/// Raft log entry representing a lock operation
+/// Raft log entry representing a lock operation. `at_unix`/`ttl_secs` are stamped by the
+/// leader before submission so lock acquisition and expiry are deterministic across nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LockCommand {
-    AcquireLock { ticket_id: u64, user_id: Uuid },
-    ReleaseLock { ticket_id: u64, user_id: Uuid },
+    AcquireLock {
+        ticket_id: u64,
+        user_id: Uuid,
+        #[serde(default)]
+        at_unix: i64,
+        #[serde(default)]
+        ttl_secs: i64,
+    },
+    ReleaseLock {
+        ticket_id: u64,
+        user_id: Uuid,
+    },
 }
 
 impl LockCommand {
-    /// Apply this command to storage
+    /// Apply this command to storage (unconditionally — exclusivity/expiry checks live in the
+    /// state machine; this is the raw mutation used by lower-level paths and tests).
     ///
     /// # Errors
     ///
     /// Returns an error if the command cannot be applied.
     pub fn apply(&self, storage: &Storage) -> Result<()> {
         match self {
-            Self::AcquireLock { ticket_id, user_id } => storage.acquire_lock(*ticket_id, *user_id),
+            Self::AcquireLock {
+                ticket_id,
+                user_id,
+                at_unix,
+                ttl_secs,
+            } => storage.acquire_lock_at(*ticket_id, *user_id, *at_unix, *ttl_secs),
             Self::ReleaseLock { ticket_id, .. } => storage.release_lock(*ticket_id),
         }
     }
@@ -264,6 +334,26 @@ mod tests {
         // Release lock
         storage.release_lock(ticket_id).unwrap();
         assert!(!storage.is_locked(ticket_id).unwrap());
+    }
+
+    #[test]
+    fn lock_expiry_is_recorded_and_evaluated() {
+        let storage = Storage::new_temp().unwrap();
+        let user = Uuid::new_v4();
+
+        // TTL of 100s acquired at t=1000 -> expires at 1100.
+        storage.acquire_lock_at(7, user, 1_000, 100).unwrap();
+        let lock = storage.get_lock_info(7).unwrap().unwrap();
+        assert_eq!(lock.expires_at_unix, 1_100);
+        assert!(!lock.is_expired(1_099));
+        assert!(lock.is_expired(1_100));
+        assert!(lock.is_expired(2_000));
+
+        // TTL of 0 never expires.
+        storage.acquire_lock_at(8, user, 1_000, 0).unwrap();
+        let never = storage.get_lock_info(8).unwrap().unwrap();
+        assert_eq!(never.expires_at_unix, 0);
+        assert!(!never.is_expired(i64::MAX));
     }
 
     #[test]
