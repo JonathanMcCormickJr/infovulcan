@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     info!("Starting gRPC server on {}", addr);
 
     // Start gRPC server with both services
-    Server::builder()
+    proto::tls::apply_server_tls(Server::builder())?
         .add_service(DatabaseServer::new(db_service))
         .add_service(RaftServiceServer::new(raft_service))
         .serve(addr)

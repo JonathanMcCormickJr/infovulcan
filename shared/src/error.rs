@@ -1,8 +1,8 @@
-//! Error types for InfoVulcan system operations.
+//! Error types for `InfoVulcan` system operations.
 
 use thiserror::Error;
 
-/// InfoVulcan system errors
+/// `InfoVulcan` system errors
 #[derive(Error, Debug)]
 pub enum InfoVulcanError {
     #[error("Validation error: {0}")]
@@ -36,7 +36,7 @@ pub enum InfoVulcanError {
     ServiceUnavailable(String),
 }
 
-/// Result type alias for InfoVulcan operations
+/// Result type alias for `InfoVulcan` operations
 pub type InfoVulcanResult<T> = Result<T, InfoVulcanError>;
 
 #[cfg(test)]

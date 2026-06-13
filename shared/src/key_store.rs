@@ -1,4 +1,4 @@
-//! Shared keypair persistence for InfoVulcan services.
+//! Shared keypair persistence for `InfoVulcan` services.
 //!
 //! Provides a single canonical function for loading or generating a Kyber-768
 //! keypair so that any two services sharing the same `STORAGE_PATH` will
@@ -89,6 +89,15 @@ mod tests {
             expected_file.exists(),
             "file should be created at <storage_path>/keys.bin"
         );
+    }
+
+    #[test]
+    fn test_load_or_generate_keypair_errors_on_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A keys.bin that exists but isn't valid JSON → deserialization error path.
+        fs::write(dir.path().join(KEYPAIR_FILENAME), b"not valid json").expect("write");
+        let result = load_or_generate_keypair(dir.path());
+        assert!(result.is_err(), "corrupt keypair file must surface an error");
     }
 
     #[test]

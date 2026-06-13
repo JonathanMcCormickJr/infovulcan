@@ -1,32 +1,44 @@
-# Require 90% coverage for code that matters.
-# Skeleton main() functions are placeholders and will be replaced.
+# cargo-tarpaulin configuration.
+#
+# cargo-tarpaulin deserializes this file into a map of `config-name -> options` and runs every
+# table, so the options MUST live under a named table (here `[default]`); a bare `cargo tarpaulin`
+# then applies it. Top-level keys are parsed as config names and fail ("expected struct Config").
+#
+# IMPORTANT (cargo-tarpaulin 0.34): the whole file is deserialized as a unit, and ANY type
+# mismatch makes tarpaulin silently fall back to args-only (dropping every exclude and the gate).
+# So the value types must match the Config struct exactly:
+#   - timeout    -> Duration via humantime: needs a unit suffix ("300s"), not a bare number/string.
+#   - fail-under -> f64: must be a float literal (90.0); the toml parser won't coerce `90`.
+#   - engine     -> TraceEngine enum: PascalCase ("Llvm" / "Ptrace" / "Auto").
+# Pass `--ignore-config` to skip this file (see scripts/coverage.sh).
 
-# -- Performance flags --
-# Skip `cargo clean` between runs; reuse incremental build artifacts.
-skip-clean = true
-# Use LLVM instrumentation instead of ptrace — faster on Linux.
-engine = "Llvm"
-# Cap per-test timeout to 120s to catch runaways without wasting CI time.
-timeout = "120"
-# Avoid overriding the test-threads default so tests can run in parallel.
+[default]
+# -- Performance / engine --
+engine = "Llvm"          # LLVM source-based instrumentation (faster than ptrace on Linux)
+skip-clean = true        # reuse incremental build artifacts between runs
+timeout = "300s"         # per-test timeout (the 3-node cluster tests spin up real servers)
 implicit-test-threads = true
 
-# -- Package / file exclusions --
-# Exclude the web (WASM) crate: cargo-tarpaulin cannot instrument WebAssembly
-# targets compiled with wasm32-unknown-unknown, so web/* always reports 0%.
-# Also exclude all binary entry-point files: these contain only startup/config
-# glue and are not meaningful to test via unit tests.
-# Exclude the tests crate entirely: it contains E2E/integration infrastructure
-# (service spawning, port polling) — not business logic that needs coverage.
-packages = { include = ["shared", "proto", "db", "custodian", "auth", "lbrp", "admin", "chaos", "honeypot"] }
+# NOTE: the #[ignore]d multi-node Raft burn-in tests (three_node_cluster) are NOT run here — under
+# instrumentation their timing-sensitive elections flake. The Raft consensus/network code is covered
+# by unit + fault-injection tests instead; run the burn-in separately with `--ignored`.
 
+# Measure business-logic packages only:
+#  - web: WASM view code (tarpaulin can't instrument wasm32 — always 0%)
+#  - tests: E2E/integration harness (service spawning, port polling), not unit logic
+#  - spike-*: throwaway architecture spikes
+exclude = ["web", "tests", "spike-raft-toy", "spike-tonic-mtls"]
+
+# Files that are not part of the measured surface:
+#  - */main.rs, */build.rs: startup/config/codegen glue
+#  - performance_test.rs: a benchmark harness (its job is timing, not assertion coverage)
 exclude-files = [
-    "web/src/*",
-    "admin/src/main.rs",
-    "auth/src/main.rs",
-    "chaos/src/main.rs",
-    "custodian/src/main.rs",
-    "db/src/main.rs",
-    "honeypot/src/main.rs",
-    "lbrp/src/main.rs",
+    "*/main.rs",
+    "*/build.rs",
+    "spikes/*",
+    "db/tests/performance_test.rs",
+    "*/tests/three_node_cluster.rs",
 ]
+
+# Hard gate.
+fail-under = 90.0

@@ -16,11 +16,24 @@ pub struct CustodianClient {
 
 impl CustodianClient {
     pub async fn connect(addr: String) -> Result<Self> {
-        let channel = Channel::from_shared(addr)?.connect().await?;
+        let channel = proto::tls::connect(&addr).await?;
         let client = custodian::custodian_service_client::CustodianServiceClient::new(channel);
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
         })
+    }
+
+    /// Re-establish the underlying channel to a (possibly new) address and swap it in place.
+    ///
+    /// Used by the `services.toml` reload task to hot-redirect traffic when an endpoint changes
+    /// without restarting LBRP. Uses a *lazy* channel so the reload loop never blocks on a
+    /// handshake; the connection is established on the next RPC. Existing in-flight calls finish
+    /// on the old channel; subsequent calls use the new one.
+    pub async fn reconnect(&self, addr: &str) -> Result<()> {
+        let channel = proto::tls::connect_lazy(addr)?;
+        let mut client = self.client.lock().await;
+        *client = custodian::custodian_service_client::CustodianServiceClient::new(channel);
+        Ok(())
     }
 
     pub async fn create_ticket(
@@ -65,6 +78,19 @@ impl CustodianClient {
         Ok(response.into_inner())
     }
 
+    pub async fn query_tickets(
+        &self,
+        req: custodian::QueryTicketsRequest,
+    ) -> Result<Vec<custodian::Ticket>> {
+        let mut client = self.client.lock().await;
+        let mut stream = client.query_tickets(req).await?.into_inner();
+        let mut tickets = Vec::new();
+        while let Some(ticket) = stream.message().await? {
+            tickets.push(ticket);
+        }
+        Ok(tickets)
+    }
+
     pub async fn cluster_status(&self) -> Result<custodian::ClusterStatusResponse> {
         let mut client = self.client.lock().await;
         let response = client
@@ -82,11 +108,20 @@ pub struct AuthClient {
 
 impl AuthClient {
     pub async fn connect(addr: String) -> Result<Self> {
-        let channel = Channel::from_shared(addr)?.connect().await?;
+        let channel = proto::tls::connect(&addr).await?;
         let client = auth::auth_service_client::AuthServiceClient::new(channel);
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
         })
+    }
+
+    /// Re-establish the channel to a new address and swap it in place (see
+    /// [`CustodianClient::reconnect`]).
+    pub async fn reconnect(&self, addr: &str) -> Result<()> {
+        let channel = proto::tls::connect_lazy(addr)?;
+        let mut client = self.client.lock().await;
+        *client = auth::auth_service_client::AuthServiceClient::new(channel);
+        Ok(())
     }
 }
 
@@ -98,11 +133,20 @@ pub struct AdminClient {
 
 impl AdminClient {
     pub async fn connect(addr: String) -> Result<Self> {
-        let channel = Channel::from_shared(addr)?.connect().await?;
+        let channel = proto::tls::connect(&addr).await?;
         let client = admin::admin_service_client::AdminServiceClient::new(channel);
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
         })
+    }
+
+    /// Re-establish the channel to a new address and swap it in place (see
+    /// [`CustodianClient::reconnect`]).
+    pub async fn reconnect(&self, addr: &str) -> Result<()> {
+        let channel = proto::tls::connect_lazy(addr)?;
+        let mut client = self.client.lock().await;
+        *client = admin::admin_service_client::AdminServiceClient::new(channel);
+        Ok(())
     }
 }
 
@@ -114,7 +158,7 @@ pub struct DbClient {
 
 impl DbClient {
     pub async fn connect(addr: String) -> Result<Self> {
-        let channel = Channel::from_shared(addr)?.connect().await?;
+        let channel = proto::tls::connect(&addr).await?;
         let client = db::database_client::DatabaseClient::new(channel);
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
@@ -152,6 +196,14 @@ mod tests {
 
     #[tonic::async_trait]
     impl custodian::custodian_service_server::CustodianService for MinimalCustodianSvc {
+        type QueryTicketsStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<custodian::Ticket, tonic::Status>>>;
+        async fn query_tickets(
+            &self,
+            _: tonic::Request<custodian::QueryTicketsRequest>,
+        ) -> Result<tonic::Response<Self::QueryTicketsStream>, tonic::Status> {
+            Ok(tonic::Response::new(tokio_stream::iter(vec![])))
+        }
         async fn create_ticket(
             &self,
             _req: tonic::Request<custodian::CreateTicketRequest>,
@@ -286,6 +338,12 @@ mod tests {
         ) -> Result<tonic::Response<admin::PushAck>, tonic::Status> {
             Err(tonic::Status::unimplemented("not needed"))
         }
+        async fn record_intrusion(
+            &self,
+            _req: tonic::Request<admin::IntrusionEvent>,
+        ) -> Result<tonic::Response<admin::IntrusionAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not needed"))
+        }
     }
 
     #[derive(Clone, Default)]
@@ -293,6 +351,64 @@ mod tests {
 
     #[tonic::async_trait]
     impl db::database_server::Database for MinimalDbSvc {
+        // --- Domain RPC stubs (this mock only exercises generic KV) ---
+        type QueryTicketsStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<db::TicketRecord, tonic::Status>>>;
+        async fn create_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn get_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn update_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn soft_delete_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn query_tickets(
+            &self,
+            _: tonic::Request<db::TicketQuery>,
+        ) -> Result<tonic::Response<Self::QueryTicketsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn create_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn get_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn update_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn soft_delete_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+
         async fn put(
             &self,
             _req: tonic::Request<db::PutRequest>,

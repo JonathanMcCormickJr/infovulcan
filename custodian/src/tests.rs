@@ -55,7 +55,12 @@ mod tests {
         let user_id = Uuid::new_v4();
 
         // Test acquire lock command
-        let acquire_cmd = LockCommand::AcquireLock { ticket_id, user_id };
+        let acquire_cmd = LockCommand::AcquireLock {
+            ticket_id,
+            user_id,
+            at_unix: 0,
+            ttl_secs: 0,
+        };
         acquire_cmd.apply(&storage).unwrap();
         assert!(storage.is_locked(ticket_id).unwrap());
 

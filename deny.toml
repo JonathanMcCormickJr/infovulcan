@@ -2,9 +2,8 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [licenses]
-# Ensure all dependencies use permissive licenses compatible with our project
-unlicensed = "deny"
-copyleft = "warn"
+# Ensure all dependencies use permissive licenses compatible with our project.
+# (cargo-deny v2 schema: anything not in `allow` is denied; `unlicensed`/`copyleft` keys removed.)
 allow = [
     "MIT",
     "Apache-2.0",
@@ -48,18 +47,17 @@ skip-tree = [
 ]
 
 [advisories]
-# Check RustSec advisory database for known vulnerabilities
+# Check RustSec advisory database for known vulnerabilities.
+# (cargo-deny v2 schema: `vulnerability`/`unsound`/`notice` keys removed — vulnerabilities are
+# always denied; `unmaintained` now takes a scope. No advisory suppressions: `ignore` is empty.)
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "warn"
+# Scope the unmaintained check to crates we directly depend on (the v2 default, and the faithful
+# equivalent of this config's prior `unmaintained = "warn"`): transitive unmaintained crates
+# pulled by openraft / governor / leptos macros are not actionable upgrade-only.
+unmaintained = "workspace"
 yanked = "deny"
-notice = "warn"
-ignore = [
-    # Example: temporarily ignore specific advisories
-    # "RUSTSEC-2020-0071",
-]
+ignore = []
 
 [sources]
 # Restrict dependency sources to prevent supply chain attacks

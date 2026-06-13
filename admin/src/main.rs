@@ -41,12 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to DB
     info!("Connecting to DB at {}", db_addr);
-    let db_client = server::db::database_client::DatabaseClient::connect(db_addr).await?;
+    let channel = proto::tls::connect(&db_addr).await?;
+    let db_client = server::db::database_client::DatabaseClient::new(channel);
     let db_client = Arc::new(Mutex::new(db_client));
 
     let admin_service = AdminServiceImpl::new(db_client, keys);
 
-    Server::builder()
+    proto::tls::apply_server_tls(Server::builder())?
         .add_service(AdminServiceServer::new(admin_service))
         .serve(addr)
         .await?;

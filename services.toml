@@ -1,0 +1,18 @@
+# InfoVulcan static service discovery.
+#
+# LBRP reads this file when the `SERVICES_TOML` environment variable points at it, e.g.
+#   SERVICES_TOML=./services.toml cargo run -p lbrp
+#
+# Resolution precedence for each service is: matching env var override (AUTH_ADDR / ADMIN_ADDR /
+# CUSTODIAN_ADDR) -> the entry below -> a built-in default. LBRP re-reads this file every
+# SERVICES_RELOAD_SECS (default 30) and hot-reconnects clients whose endpoint changed, so an
+# operator can redirect traffic without a restart.
+#
+# Addresses are full gRPC endpoint URLs (scheme + host + port). Under mTLS use `https://` and the
+# DNS name that matches the service certificate's SAN.
+
+[services]
+auth = "http://[::1]:8082"
+admin = "http://[::1]:8083"
+custodian = "http://[::1]:8081"
+db = "http://[::1]:50051"

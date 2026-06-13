@@ -107,6 +107,20 @@ impl AuthServiceImpl {
     }
 }
 
+/// Verify a TOTP code (RFC 6238) against a base32-encoded secret.
+///
+/// Uses the standard parameters (SHA1, 6 digits, 30-second step) with ±1 step of skew
+/// to tolerate small clock drift between the client and server.
+fn verify_totp(secret: &str, token: &str) -> Result<bool, Status> {
+    use totp_rs::{Algorithm, Secret, TOTP};
+    let bytes = Secret::Encoded(secret.to_string())
+        .to_bytes()
+        .map_err(|e| Status::internal(format!("invalid MFA secret: {e:?}")))?;
+    let totp = TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, bytes);
+    totp.check_current(token)
+        .map_err(|e| Status::internal(format!("TOTP check failed: {e}")))
+}
+
 #[tonic::async_trait]
 impl AuthService for AuthServiceImpl {
     async fn authenticate(
@@ -152,11 +166,35 @@ impl AuthService for AuthServiceImpl {
             }));
         }
 
-        // 3. Verify MFA (TODO)
-        if user_auth.mfa_secret.is_some() {
-            // Check req.mfa_token
-            // For MVP, if token is empty but secret exists, fail? Or just skip for now?
-            // Let's skip actual verification for now but acknowledge it exists.
+        // 3. Verify MFA (TOTP, RFC 6238) when the account has an enrolled secret.
+        if let Some(secret) = user_auth.mfa_secret.as_deref() {
+            // Audited escape hatch: MFA_DISABLED=1 skips enforcement (logged loudly).
+            let disabled = std::env::var("MFA_DISABLED").is_ok_and(|v| v == "1");
+            if disabled {
+                tracing::warn!(
+                    "MFA_DISABLED=1: skipping MFA verification for user {} (audited)",
+                    req.username
+                );
+            } else if req.mfa_token.trim().is_empty() {
+                tracing::warn!(
+                    "MFA token required but not provided for user {}",
+                    req.username
+                );
+                return Ok(Response::new(AuthenticateResponse {
+                    success: false,
+                    session_token: String::new(),
+                    error: "MFA token required".to_string(),
+                    user: None,
+                }));
+            } else if !verify_totp(secret, req.mfa_token.trim())? {
+                tracing::warn!("Invalid MFA token for user {}", req.username);
+                return Ok(Response::new(AuthenticateResponse {
+                    success: false,
+                    session_token: String::new(),
+                    error: "Invalid MFA token".to_string(),
+                    user: None,
+                }));
+            }
         }
 
         // 4. Fetch User Profile
@@ -270,6 +308,33 @@ mod tests {
     use serde::Serialize;
     use std::collections::HashMap;
     use std::net::SocketAddr;
+
+    #[test]
+    fn verify_totp_accepts_current_code_and_rejects_wrong() {
+        use totp_rs::{Algorithm, Secret, TOTP};
+        let secret = "JBSWY3DPEHPK3PXP"; // valid base32
+        let bytes = Secret::Encoded(secret.to_string()).to_bytes().unwrap();
+        let totp = TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, bytes);
+
+        let code = totp.generate_current().unwrap();
+        assert!(
+            verify_totp(secret, &code).unwrap(),
+            "the current TOTP code must be accepted"
+        );
+
+        // A clearly different code must be rejected (avoid colliding with `code`).
+        let wrong = if code == "000000" { "111111" } else { "000000" };
+        assert!(
+            !verify_totp(secret, wrong).unwrap(),
+            "an incorrect TOTP code must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_totp_errors_on_invalid_secret() {
+        // Not valid base32 -> a clean internal error rather than a panic.
+        assert!(verify_totp("not!base32!", "123456").is_err());
+    }
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use tokio::sync::RwLock;
@@ -286,6 +351,64 @@ mod tests {
 
     #[tonic::async_trait]
     impl db::database_server::Database for MockDb {
+        // --- Domain RPC stubs (this mock only exercises generic KV) ---
+        type QueryTicketsStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<db::TicketRecord, tonic::Status>>>;
+        async fn create_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn get_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn update_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn soft_delete_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn query_tickets(
+            &self,
+            _: tonic::Request<db::TicketQuery>,
+        ) -> Result<tonic::Response<Self::QueryTicketsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn create_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn get_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn update_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+        async fn soft_delete_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("mock"))
+        }
+
         async fn put(
             &self,
             _request: Request<db::PutRequest>,
@@ -693,6 +816,64 @@ mod tests {
 
     #[tonic::async_trait]
     impl db::database_server::Database for ErrorDb {
+        // --- Domain RPC stubs (this mock only exercises generic KV) ---
+        type QueryTicketsStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<db::TicketRecord, tonic::Status>>>;
+        async fn create_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn get_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn update_ticket(
+            &self,
+            _: tonic::Request<db::TicketWrite>,
+        ) -> Result<tonic::Response<db::TicketRecord>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn soft_delete_ticket(
+            &self,
+            _: tonic::Request<db::TicketLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn query_tickets(
+            &self,
+            _: tonic::Request<db::TicketQuery>,
+        ) -> Result<tonic::Response<Self::QueryTicketsStream>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn create_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn get_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn update_user(
+            &self,
+            _: tonic::Request<db::UserWrite>,
+        ) -> Result<tonic::Response<db::UserRecord>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+        async fn soft_delete_user(
+            &self,
+            _: tonic::Request<db::UserLookup>,
+        ) -> Result<tonic::Response<db::DeleteAck>, tonic::Status> {
+            Err(tonic::Status::internal("error db"))
+        }
+
         async fn put(
             &self,
             _request: Request<db::PutRequest>,

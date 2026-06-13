@@ -1,4 +1,4 @@
-//! Encryption utilities for InfoVulcan.
+//! Encryption utilities for `InfoVulcan`.
 //!
 //! This module provides encryption capabilities for sensitive data.
 //! Currently implements symmetric encryption with AES-GCM and ChaCha20-Poly1305.
@@ -399,6 +399,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decrypt_with_password_requires_salt() {
+        let data = EncryptedData {
+            algorithm: EncryptionAlgorithm::Aes256Gcm,
+            salt: None,
+            kem_ciphertext: None,
+            nonce: vec![0u8; 12],
+            ciphertext: vec![1, 2, 3],
+        };
+        assert!(EncryptionService::decrypt_with_password(&data, "pw").is_err());
+    }
+
+    #[test]
+    fn encrypt_with_public_key_rejects_malformed_key() {
+        assert!(EncryptionService::encrypt_with_public_key(b"x", &[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_private_key_rejects_bad_inputs_but_round_trips() {
+        let (pk, sk) = EncryptionService::generate_keypair().unwrap();
+        let enc = EncryptionService::encrypt_with_public_key(b"secret", &pk).unwrap();
+
+        // Wrong-size private key → error.
+        assert!(EncryptionService::decrypt_with_private_key(&enc, &[0u8; 4]).is_err());
+
+        // Missing KEM ciphertext → error.
+        let mut no_kem = enc.clone();
+        no_kem.kem_ciphertext = None;
+        assert!(EncryptionService::decrypt_with_private_key(&no_kem, &sk).is_err());
+
+        // A different keypair's private key → decapsulation/decryption fails.
+        let (_pk2, sk2) = EncryptionService::generate_keypair().unwrap();
+        assert!(EncryptionService::decrypt_with_private_key(&enc, &sk2).is_err());
+
+        // The genuine key still round-trips.
+        assert_eq!(
+            EncryptionService::decrypt_with_private_key(&enc, &sk).unwrap(),
+            b"secret"
+        );
+    }
+
+    #[test]
     fn test_password_encryption_round_trip() {
         let original_data = b"Hello, encrypted world!";
         let password = "my-secret-password";
@@ -653,6 +694,48 @@ mod tests {
         let encrypted = EncryptionService::encrypt_with_password(data, password).unwrap();
         let decrypted = EncryptionService::decrypt_with_password(&encrypted, password).unwrap();
         assert_eq!(data.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn decrypt_with_private_key_fails_on_malformed_kem_ciphertext() {
+        // A correctly-sized private key but a KEM ciphertext of the wrong length makes the
+        // Kyber decapsulation step itself fail (the error closure on the decapsulate path).
+        let (_pk, sk) = EncryptionService::generate_keypair().unwrap();
+        let bad = EncryptedData {
+            algorithm: EncryptionAlgorithm::ChaCha20Poly1305,
+            salt: None,
+            kem_ciphertext: Some(vec![0u8; 8]), // not KYBER_CIPHERTEXTBYTES
+            nonce: vec![0u8; 12],
+            ciphertext: vec![0u8; 16],
+        };
+        assert!(EncryptionService::decrypt_with_private_key(&bad, &sk).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_password_fails_on_too_short_salt() {
+        // Argon2 rejects an undersized salt, exercising the key-derivation error path.
+        let bad = EncryptedData {
+            algorithm: EncryptionAlgorithm::ChaCha20Poly1305,
+            salt: Some(vec![0u8; 2]), // Argon2 requires >= 8 bytes
+            kem_ciphertext: None,
+            nonce: vec![0u8; 12],
+            ciphertext: vec![0u8; 16],
+        };
+        assert!(EncryptionService::decrypt_with_password(&bad, "pw").is_err());
+    }
+
+    #[test]
+    fn aes_gcm_decrypt_fails_on_tampered_ciphertext() {
+        // Encrypt with AES-256-GCM, then corrupt the ciphertext so the authentication tag
+        // no longer verifies — covers the AES-GCM symmetric-decryption error closure.
+        let mut enc = EncryptionService::encrypt_with_password_and_algorithm(
+            b"data",
+            "pw",
+            EncryptionAlgorithm::Aes256Gcm,
+        )
+        .unwrap();
+        enc.ciphertext[0] ^= 0xFF;
+        assert!(EncryptionService::decrypt_with_password(&enc, "pw").is_err());
     }
 
     #[test]

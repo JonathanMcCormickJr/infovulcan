@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Chaos service listening on {addr}");
 
-    Server::builder()
+    proto::tls::apply_server_tls(Server::builder())?
         .add_service(
             chaos_service::chaos::chaos_service_server::ChaosServiceServer::new(chaos_service),
         )

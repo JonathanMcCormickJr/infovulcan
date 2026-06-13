@@ -66,6 +66,8 @@ fn start_service(name: &str, bin: &str, env: Vec<(&str, &str)>) -> Result<Servic
     })
 }
 
+/// Full MVP lifecycle over the real REST -> gRPC -> Raft path:
+/// create admin user -> login -> create ticket -> get ticket -> query/list tickets.
 #[tokio::test]
 #[ignore = "E2E test spawns 5 services with port polling; run explicitly with --ignored"]
 async fn test_e2e_flow() -> Result<()> {
@@ -212,7 +214,43 @@ async fn test_e2e_flow() -> Result<()> {
         "unexpected create ticket response: status={}, body={}",
         ticket_status, ticket_body
     );
-    println!("Created ticket");
+    let created: serde_json::Value = serde_json::from_str(&ticket_body)?;
+    let ticket_id = created["ticket_id"]
+        .as_u64()
+        .context("create response missing ticket_id")?;
+    println!("Created ticket {ticket_id}");
+
+    // D. Get the ticket by id via LBRP -> Custodian -> DB (read round-trip).
+    let get_resp = client
+        .get(format!("http://127.0.0.1:8080/api/tickets/{ticket_id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(get_resp.status(), 200, "get ticket should succeed");
+    let got: serde_json::Value = get_resp.json().await?;
+    assert_eq!(
+        got["ticket_id"].as_u64(),
+        Some(ticket_id),
+        "fetched ticket id mismatch"
+    );
+    assert_eq!(got["title"].as_str(), Some("System Down"));
+    println!("Fetched ticket {ticket_id}");
+
+    // E. List/query tickets via LBRP -> Custodian (QueryTickets stream) -> DB.
+    let list_resp = client
+        .get("http://127.0.0.1:8080/api/tickets")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    assert_eq!(list_resp.status(), 200, "list tickets should succeed");
+    let listed: Vec<serde_json::Value> = list_resp.json().await?;
+    assert!(
+        listed
+            .iter()
+            .any(|t| t["ticket_id"].as_u64() == Some(ticket_id)),
+        "expected QueryTickets to include ticket {ticket_id}, got {listed:?}"
+    );
+    println!("Listed {} ticket(s) via QueryTickets", listed.len());
 
     Ok(())
 }

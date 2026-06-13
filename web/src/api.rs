@@ -3,6 +3,28 @@ use serde::{Deserialize, Serialize};
 
 const TOKEN_KEY: &str = "infovulcan_demo_token";
 
+/// A ticket's scheduled next action (read-only mirror of the REST `next_action` field).
+/// `None` (JSON `null`) means no action is scheduled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NextAction {
+    FollowUp { at: i64 },
+    Appointment { at: i64 },
+    AutoClose { schedule: String },
+}
+
+impl NextAction {
+    /// A short human-readable summary for display.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            NextAction::FollowUp { at } => format!("Follow up @ {at}"),
+            NextAction::Appointment { at } => format!("Appointment @ {at}"),
+            NextAction::AutoClose { schedule } => format!("Auto-close ({schedule})"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Ticket {
     pub ticket_id: u64,
@@ -10,6 +32,8 @@ pub struct Ticket {
     pub project: String,
     pub priority: i32,
     pub status: i32,
+    #[serde(default)]
+    pub next_action: Option<NextAction>,
 }
 
 #[derive(Serialize)]
@@ -134,6 +158,69 @@ pub async fn create_ticket(token: &str, payload: &CreateTicketRequest) -> Result
     response.json().await.map_err(|e| e.to_string())
 }
 
+/// Filters for the ticket list query (`GET /api/tickets`). Empty fields are omitted.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ListTicketsFilter {
+    pub status: Option<i32>,
+    pub assignee: String,
+    pub account: String,
+    pub project: String,
+    pub include_deleted: bool,
+    pub limit: Option<u32>,
+}
+
+impl ListTicketsFilter {
+    /// Build the `?key=value&…` query string (without a leading `?`). Blank/None fields are
+    /// skipped so the backend treats them as "no filter".
+    #[must_use]
+    pub fn to_query_string(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(status) = self.status {
+            parts.push(format!("status={status}"));
+        }
+        if !self.assignee.trim().is_empty() {
+            parts.push(format!("assignee={}", self.assignee.trim()));
+        }
+        if !self.account.trim().is_empty() {
+            parts.push(format!("account={}", self.account.trim()));
+        }
+        if !self.project.trim().is_empty() {
+            parts.push(format!("project={}", self.project.trim()));
+        }
+        if self.include_deleted {
+            parts.push("include_deleted=true".to_string());
+        }
+        if let Some(limit) = self.limit {
+            parts.push(format!("limit={limit}"));
+        }
+        parts.join("&")
+    }
+}
+
+pub async fn list_tickets(token: &str, filter: &ListTicketsFilter) -> Result<Vec<Ticket>, String> {
+    let query = filter.to_query_string();
+    let url = if query.is_empty() {
+        "/api/tickets".to_string()
+    } else {
+        format!("/api/tickets?{query}")
+    };
+
+    let response = Request::get(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !response.ok() {
+        return Err(response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Ticket list failed".to_string()));
+    }
+
+    response.json().await.map_err(|e| e.to_string())
+}
+
 pub async fn fetch_ticket(token: &str, ticket_id: u64) -> Result<Ticket, String> {
     let response = Request::get(&format!("/api/tickets/{ticket_id}"))
         .header("Authorization", &format!("Bearer {token}"))
@@ -172,4 +259,58 @@ pub async fn update_ticket(
     }
 
     response.json().await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_filter_produces_no_query() {
+        assert_eq!(ListTicketsFilter::default().to_query_string(), "");
+    }
+
+    #[test]
+    fn filter_builds_query_in_field_order() {
+        let filter = ListTicketsFilter {
+            status: Some(2),
+            assignee: "  alice  ".to_string(),
+            account: String::new(),
+            project: "acme".to_string(),
+            include_deleted: true,
+            limit: Some(50),
+        };
+        assert_eq!(
+            filter.to_query_string(),
+            "status=2&assignee=alice&project=acme&include_deleted=true&limit=50"
+        );
+    }
+
+    #[test]
+    fn blank_strings_are_skipped() {
+        let filter = ListTicketsFilter {
+            assignee: "   ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(filter.to_query_string(), "");
+    }
+
+    #[test]
+    fn next_action_summaries_render() {
+        assert_eq!(
+            NextAction::FollowUp { at: 5 }.summary(),
+            "Follow up @ 5".to_string()
+        );
+        assert_eq!(
+            NextAction::Appointment { at: 9 }.summary(),
+            "Appointment @ 9".to_string()
+        );
+        assert_eq!(
+            NextAction::AutoClose {
+                schedule: "hours_24".to_string()
+            }
+            .summary(),
+            "Auto-close (hours_24)".to_string()
+        );
+    }
 }

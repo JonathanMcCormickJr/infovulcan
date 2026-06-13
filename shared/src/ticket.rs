@@ -1,4 +1,4 @@
-//! Ticket types and enums for the InfoVulcan system.
+//! Ticket types and enums for the `InfoVulcan` system.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -279,6 +279,74 @@ impl TicketStatus {
             Self::Open | Self::AwaitingCustomer | Self::AwaitingISP | Self::AwaitingPartner
         )
     }
+
+    /// Whether this is a terminal status (a lifecycle sink with no outgoing transitions).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Closed | Self::AutoClose)
+    }
+
+    /// Policy-as-code: the statuses a ticket may move **to** from `self`.
+    ///
+    /// This is the single source of truth for the ticket lifecycle state machine; tighten
+    /// or loosen the workflow by editing these allow-lists. Terminal states return an empty
+    /// slice. A no-op (`self -> self`) is always permitted and is handled by
+    /// [`TicketStatus::can_transition_to`], not encoded here.
+    #[must_use]
+    pub fn allowed_transitions(self) -> &'static [TicketStatus] {
+        use TicketStatus::{
+            AppointmentScheduled, AutoClose, AwaitingCustomer, AwaitingISP, AwaitingPartner,
+            Closed, EbondReceived, HandedOff, Open, SupportHold, VoicemailReceived,
+        };
+        match self {
+            Open => &[
+                AwaitingCustomer,
+                AwaitingISP,
+                AwaitingPartner,
+                SupportHold,
+                HandedOff,
+                AppointmentScheduled,
+                EbondReceived,
+                VoicemailReceived,
+                Closed,
+                AutoClose,
+            ],
+            AwaitingCustomer => &[
+                Open,
+                SupportHold,
+                AppointmentScheduled,
+                EbondReceived,
+                VoicemailReceived,
+                Closed,
+                AutoClose,
+            ],
+            AwaitingISP => &[Open, SupportHold, EbondReceived, Closed, AutoClose],
+            AwaitingPartner => &[Open, SupportHold, HandedOff, Closed, AutoClose],
+            SupportHold => &[
+                Open,
+                AwaitingCustomer,
+                AwaitingISP,
+                AwaitingPartner,
+                AppointmentScheduled,
+                Closed,
+                AutoClose,
+            ],
+            HandedOff => &[Open, AwaitingPartner, Closed, AutoClose],
+            AppointmentScheduled => &[Open, AwaitingCustomer, SupportHold, Closed, AutoClose],
+            EbondReceived => &[Open, AwaitingISP, Closed, AutoClose],
+            VoicemailReceived => &[Open, AwaitingCustomer, Closed, AutoClose],
+            // Terminal states and any future variant: no outgoing transitions.
+            _ => &[],
+        }
+    }
+
+    /// Policy-as-code check: whether a ticket may transition from `self` to `to`.
+    /// A no-op (`self == to`) is always allowed so other fields can be updated without a
+    /// status change.
+    #[must_use]
+    pub fn can_transition_to(self, to: TicketStatus) -> bool {
+        self == to || self.allowed_transitions().contains(&to)
+    }
 }
 
 /// Resolution types
@@ -551,6 +619,42 @@ impl Ticket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_can_transition_to_working_and_terminal_states() {
+        let open = TicketStatus::Open;
+        assert!(open.can_transition_to(TicketStatus::AwaitingCustomer));
+        assert!(open.can_transition_to(TicketStatus::Closed));
+        assert!(open.can_transition_to(TicketStatus::AutoClose));
+    }
+
+    #[test]
+    fn terminal_states_are_sinks() {
+        for terminal in [TicketStatus::Closed, TicketStatus::AutoClose] {
+            assert!(terminal.is_terminal());
+            assert!(terminal.allowed_transitions().is_empty());
+            // No outgoing transition except the no-op self-transition.
+            assert!(terminal.can_transition_to(terminal));
+            assert!(!terminal.can_transition_to(TicketStatus::Open));
+            assert!(!terminal.can_transition_to(TicketStatus::AwaitingISP));
+        }
+    }
+
+    #[test]
+    fn noop_transition_is_always_allowed() {
+        // Even a terminal state allows updating other fields without a status change.
+        assert!(TicketStatus::Closed.can_transition_to(TicketStatus::Closed));
+        assert!(TicketStatus::AwaitingISP.can_transition_to(TicketStatus::AwaitingISP));
+    }
+
+    #[test]
+    fn disallowed_transition_is_rejected() {
+        // EbondReceived's policy does not permit jumping straight to AppointmentScheduled.
+        assert!(!TicketStatus::EbondReceived.can_transition_to(TicketStatus::AppointmentScheduled));
+        // But it can go back to Open or to AwaitingISP.
+        assert!(TicketStatus::EbondReceived.can_transition_to(TicketStatus::Open));
+        assert!(TicketStatus::EbondReceived.can_transition_to(TicketStatus::AwaitingISP));
+    }
 
     #[test]
     fn test_new_ticket_has_open_status() {
@@ -1063,5 +1167,74 @@ mod tests {
         let update = ticket.format_tracking_update("Tech", "SITE-1", "123 Main St", "Notes");
         assert!(update.contains("ASUS DSL-N14U"));
         assert!(update.contains("N/A"));
+    }
+
+    #[test]
+    fn mac_address_accessor_returns_mac_for_remaining_variants() {
+        // device_type/make_model are exercised elsewhere; this covers mac_address() for the
+        // wireless / gateway / switch / router arms specifically.
+        let mac = MacAddress::new("00:11:22:33:44:55").unwrap();
+        let devices = [
+            NetworkDevice::FixedWirelessAntenna {
+                make: "Ubiquiti".to_string(),
+                model: "LiteBeam".to_string(),
+                mac_address: Some(mac.clone()),
+                serial_number: None,
+            },
+            NetworkDevice::VpnGw {
+                make: "Cisco".to_string(),
+                model: "ASA".to_string(),
+                mac_address: Some(mac.clone()),
+                serial_number: None,
+            },
+            NetworkDevice::Switch {
+                make: "Netgear".to_string(),
+                model: "GS108".to_string(),
+                mac_address: Some(mac.clone()),
+                serial_number: None,
+            },
+            NetworkDevice::Router {
+                make: "MikroTik".to_string(),
+                model: "hEX".to_string(),
+                mac_address: Some(mac.clone()),
+                serial_number: None,
+            },
+        ];
+        for d in &devices {
+            assert_eq!(d.mac_address(), Some(&mac));
+        }
+    }
+
+    #[test]
+    fn allowed_transitions_enumerated_for_every_non_terminal_state() {
+        use TicketStatus::{
+            AppointmentScheduled, AutoClose, AwaitingCustomer, AwaitingISP, AwaitingPartner,
+            Closed, EbondReceived, HandedOff, Open, SupportHold, VoicemailReceived,
+        };
+        // Each non-terminal source state exposes a non-empty allow-list and can always reach
+        // both terminal sinks plus return to Open.
+        let sources = [
+            AwaitingCustomer,
+            AwaitingISP,
+            AwaitingPartner,
+            SupportHold,
+            HandedOff,
+            AppointmentScheduled,
+            EbondReceived,
+            VoicemailReceived,
+        ];
+        for s in sources {
+            assert!(!s.allowed_transitions().is_empty());
+            assert!(s.can_transition_to(Closed));
+            assert!(s.can_transition_to(AutoClose));
+            assert!(s.can_transition_to(Open));
+        }
+        // Representative legal / illegal edges unique to specific states.
+        assert!(AwaitingPartner.can_transition_to(HandedOff));
+        assert!(!AwaitingISP.can_transition_to(HandedOff));
+        assert!(SupportHold.can_transition_to(AppointmentScheduled));
+        assert!(AppointmentScheduled.can_transition_to(AwaitingCustomer));
+        assert!(EbondReceived.can_transition_to(AwaitingISP));
+        assert!(VoicemailReceived.can_transition_to(AwaitingCustomer));
     }
 }

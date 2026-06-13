@@ -1,0 +1,28 @@
+{
+  "_comment": "NanoVMs OPS image config for the InfoVulcan lbrp service (public REST gateway + static web). The ONLY internet-facing image. Serves the WASM bundle from /web/dist and reads services.toml for backend discovery. The ./lbrp-conf dir (mapped to /etc/infovulcan) must hold services.toml and a certs/ subdir. UNVALIDATED template — see deploy/README.md.",
+  "Args": [],
+  "Env": {
+    "LISTEN_ADDR": "0.0.0.0:8080",
+    "JWT_SECRET": "REPLACE_WITH_SHARED_SECRET",
+    "WEB_DIST_DIR": "/web/dist",
+    "SERVICES_TOML": "/etc/infovulcan/services.toml",
+    "SERVICES_RELOAD_SECS": "30",
+    "RATE_LIMIT_PER_SEC": "20",
+    "RATE_LIMIT_BURST": "40",
+    "CORS_ALLOWED_ORIGINS": "https://app.infovulcan.example",
+    "TLS_CA_CERT": "/etc/infovulcan/certs/ca.crt",
+    "TLS_CERT": "/etc/infovulcan/certs/lbrp.crt",
+    "TLS_KEY": "/etc/infovulcan/certs/lbrp.key",
+    "TLS_DOMAIN": "lbrp",
+    "RUST_LOG": "info"
+  },
+  "MapDirs": {
+    "/web/dist": "../web/dist",
+    "/etc/infovulcan": "./lbrp-conf"
+  },
+  "RunConfig": {
+    "Ports": ["8080"],
+    "Memory": "256m"
+  },
+  "BaseVolumeSz": "512m"
+}

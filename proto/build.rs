@@ -11,6 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../chaos/proto/chaos.proto");
     println!("cargo:rerun-if-changed=../custodian/proto/custodian.proto");
     println!("cargo:rerun-if-changed=../db/proto/db.proto");
+    println!("cargo:rerun-if-changed=../honeypot/proto/honeypot.proto");
 
     tonic_prost_build::configure()
         .build_server(true)
@@ -22,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../chaos/proto/chaos.proto",
                 "../custodian/proto/custodian.proto",
                 "../db/proto/db.proto",
+                "../honeypot/proto/honeypot.proto",
             ],
             &[
                 "../admin/proto",
@@ -29,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../chaos/proto",
                 "../custodian/proto",
                 "../db/proto",
+                "../honeypot/proto",
             ],
         )?;
     Ok(())

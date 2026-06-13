@@ -8,8 +8,8 @@ async fn test_push_metrics_to_admin() {
     use custodian::admin_client::admin::admin_service_server::{AdminService, AdminServiceServer};
     use custodian::admin_client::admin::{
         CreateUserRequest, CreateUserResponse, DeleteUserRequest, DeleteUserResponse,
-        GetUserRequest, GetUserResponse, ListUsersRequest, ListUsersResponse, MetricsSnapshot,
-        PushAck, UpdateUserRequest, UpdateUserResponse,
+        GetUserRequest, GetUserResponse, IntrusionAck, IntrusionEvent, ListUsersRequest,
+        ListUsersResponse, MetricsSnapshot, PushAck, UpdateUserRequest, UpdateUserResponse,
     };
 
     #[derive(Default)]
@@ -56,6 +56,12 @@ async fn test_push_metrics_to_admin() {
             let mut g = self.0.lock().await;
             *g = Some(msg);
             Ok(Response::new(PushAck { ok: true }))
+        }
+        async fn record_intrusion(
+            &self,
+            _request: Request<IntrusionEvent>,
+        ) -> Result<Response<IntrusionAck>, Status> {
+            Err(Status::unimplemented("not needed for test"))
         }
     }
 

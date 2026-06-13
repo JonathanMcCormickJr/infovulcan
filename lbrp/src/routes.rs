@@ -1,10 +1,11 @@
 //! REST API route handlers for LBRP
 
 use crate::clients::{AdminClient, AuthClient, CustodianClient};
+use crate::error::ApiError;
 use crate::middleware::{AuthState, Claims, auth_middleware};
 use axum::{
     Extension, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Json},
@@ -35,6 +36,41 @@ pub struct LoginResponse {
     pub token: String,
 }
 
+/// JSON representation of a ticket's next action (read-only in the REST API).
+/// Absent (`null`) means no action is scheduled.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApiNextAction {
+    /// Follow up at the given unix-seconds timestamp.
+    FollowUp { at: i64 },
+    /// Appointment at the given unix-seconds timestamp.
+    Appointment { at: i64 },
+    /// Auto-close on a named schedule (`end_of_day` | `hours_24` | `hours_48` | `hours_72`).
+    AutoClose { schedule: String },
+}
+
+fn map_next_action(
+    next_action: Option<crate::clients::custodian::NextAction>,
+) -> Option<ApiNextAction> {
+    use crate::clients::custodian::{AutoCloseSchedule, next_action::Kind};
+    let kind = next_action?.kind?;
+    Some(match kind {
+        Kind::FollowUp(ts) => ApiNextAction::FollowUp { at: ts.seconds },
+        Kind::Appointment(ts) => ApiNextAction::Appointment { at: ts.seconds },
+        Kind::AutoClose(value) => {
+            let schedule = match AutoCloseSchedule::try_from(value) {
+                Ok(AutoCloseSchedule::Hours24) => "hours_24",
+                Ok(AutoCloseSchedule::Hours48) => "hours_48",
+                Ok(AutoCloseSchedule::Hours72) => "hours_72",
+                _ => "end_of_day",
+            };
+            ApiNextAction::AutoClose {
+                schedule: schedule.to_string(),
+            }
+        }
+    })
+}
+
 #[derive(Serialize)]
 pub struct ApiTicket {
     pub ticket_id: u64,
@@ -42,6 +78,7 @@ pub struct ApiTicket {
     pub project: String,
     pub priority: i32,
     pub status: i32,
+    pub next_action: Option<ApiNextAction>,
 }
 
 fn map_ticket(ticket: crate::clients::custodian::Ticket) -> ApiTicket {
@@ -51,13 +88,14 @@ fn map_ticket(ticket: crate::clients::custodian::Ticket) -> ApiTicket {
         project: ticket.project,
         priority: ticket.priority,
         status: ticket.status,
+        next_action: map_next_action(ticket.next_action),
     }
 }
 
 async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let mut client = state.auth_client.client.lock().await;
 
     let req = crate::clients::auth::AuthenticateRequest {
@@ -68,11 +106,7 @@ async fn login(
 
     let resp = client.authenticate(req).await.map_err(|e| {
         tracing::error!("Auth service error: {}", e);
-        match e.code() {
-            tonic::Code::Unauthenticated => (StatusCode::UNAUTHORIZED, e.message().to_string()),
-            tonic::Code::InvalidArgument => (StatusCode::BAD_REQUEST, e.message().to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()),
-        }
+        ApiError::from(e)
     })?;
 
     let resp_inner = resp.into_inner();
@@ -81,7 +115,7 @@ async fn login(
             token: resp_inner.session_token,
         }))
     } else {
-        Err((StatusCode::UNAUTHORIZED, resp_inner.error))
+        Err(ApiError::unauthorized(resp_inner.error))
     }
 }
 
@@ -99,7 +133,7 @@ pub struct CreateUserRequest {
 async fn create_user(
     State(state): State<AppState>,
     Json(payload): Json<CreateUserRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let mut client = state.admin_client.client.lock().await;
 
     let req = crate::clients::admin::CreateUserRequest {
@@ -110,10 +144,7 @@ async fn create_user(
         role: payload.role,
     };
 
-    let _resp = client
-        .create_user(req)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()))?;
+    let _resp = client.create_user(req).await.map_err(ApiError::from)?;
 
     Ok(StatusCode::CREATED)
 }
@@ -133,7 +164,7 @@ async fn create_ticket(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Json(payload): Json<CreateTicketRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let req = crate::clients::custodian::CreateTicketRequest {
         title: payload.title,
         project: payload.project,
@@ -153,7 +184,7 @@ async fn create_ticket(
         .custodian_client
         .create_ticket(req)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(map_ticket(resp))))
 }
@@ -161,16 +192,50 @@ async fn create_ticket(
 async fn get_ticket(
     State(state): State<AppState>,
     Path(id): Path<u64>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let req = crate::clients::custodian::GetTicketRequest { ticket_id: id };
 
     let resp = state
         .custodian_client
         .get_ticket(req)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        .map_err(|e| ApiError::not_found(e.to_string()))?;
 
     Ok(Json(map_ticket(resp)))
+}
+
+/// Query params for `GET /api/tickets` (e.g. `?status=1&assignee=<uuid>&project=foo`).
+#[derive(Deserialize)]
+pub struct ListTicketsParams {
+    pub status: Option<u32>,
+    pub assignee: Option<String>,
+    pub account: Option<String>,
+    pub project: Option<String>,
+    pub include_deleted: Option<bool>,
+    pub limit: Option<u32>,
+}
+
+async fn list_tickets(
+    State(state): State<AppState>,
+    Query(params): Query<ListTicketsParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = crate::clients::custodian::QueryTicketsRequest {
+        status: params.status,
+        assigned_to_uuid: params.assignee,
+        account_uuid: params.account,
+        project: params.project,
+        include_deleted: params.include_deleted.unwrap_or(false),
+        limit: params.limit.unwrap_or(0),
+    };
+
+    let tickets = state
+        .custodian_client
+        .query_tickets(req)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let out: Vec<ApiTicket> = tickets.into_iter().map(map_ticket).collect();
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -186,7 +251,7 @@ async fn update_ticket(
     Path(id): Path<u64>,
     Extension(claims): Extension<Claims>,
     Json(payload): Json<UpdateTicketRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, ApiError> {
     let req = crate::clients::custodian::UpdateTicketRequest {
         ticket_id: id,
         title: payload.title,
@@ -207,9 +272,37 @@ async fn update_ticket(
         .custodian_client
         .update_ticket(req)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(Json(map_ticket(resp)))
+}
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub services: std::collections::BTreeMap<String, &'static str>,
+}
+
+/// Aggregated health endpoint. Probes reachable downstream services and reports overall
+/// status (`200 ok` / `503 degraded`). Currently probes the custodian (via its cluster
+/// status); auth/db lack a Health RPC reachable from LBRP and are a tracked follow-up.
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let mut services = std::collections::BTreeMap::new();
+
+    let custodian_ok = state.custodian_client.cluster_status().await.is_ok();
+    services.insert(
+        "custodian".to_string(),
+        if custodian_ok { "up" } else { "down" },
+    );
+
+    let all_ok = custodian_ok;
+    let status = if all_ok { "ok" } else { "degraded" };
+    let code = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(HealthResponse { status, services }))
 }
 
 pub fn app(state: AppState) -> Router {
@@ -220,7 +313,7 @@ pub fn app(state: AppState) -> Router {
     let admin_routes = Router::new().route("/admin/users", post(create_user));
 
     let api_routes = Router::new()
-        .route("/tickets", post(create_ticket))
+        .route("/tickets", post(create_ticket).get(list_tickets))
         .route("/tickets/{id}", get(get_ticket).put(update_ticket))
         .layer(middleware::from_fn_with_state(
             state.auth_state.clone(),
@@ -228,10 +321,34 @@ pub fn app(state: AppState) -> Router {
         ));
 
     Router::new()
+        .route("/health", get(health))
         .nest("/auth", auth_routes)
         .nest("/api", admin_routes)
         .nest("/api", api_routes)
         .with_state(state)
+        // Response compression (gzip/brotli) negotiated via Accept-Encoding.
+        .layer(tower_http::compression::CompressionLayer::new())
+        // CORS so the WASM frontend can call the API cross-origin during development.
+        .layer(cors_layer())
+}
+
+/// CORS policy. Allowed origins come from `CORS_ALLOWED_ORIGINS` (comma-separated); if unset,
+/// any origin is allowed (convenient for local dev / same-origin static serving).
+fn cors_layer() -> tower_http::cors::CorsLayer {
+    use axum::http::{HeaderValue, Method, header};
+    let base = tower_http::cors::CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    match std::env::var("CORS_ALLOWED_ORIGINS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let origins: Vec<HeaderValue> = raw
+                .split(',')
+                .filter_map(|o| o.trim().parse().ok())
+                .collect();
+            base.allow_origin(origins)
+        }
+        _ => base.allow_origin(tower_http::cors::Any),
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +483,12 @@ mod tests {
         ) -> Result<tonic::Response<crate::clients::admin::PushAck>, tonic::Status> {
             Err(tonic::Status::unimplemented("not needed"))
         }
+        async fn record_intrusion(
+            &self,
+            _req: tonic::Request<crate::clients::admin::IntrusionEvent>,
+        ) -> Result<tonic::Response<crate::clients::admin::IntrusionAck>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not needed"))
+        }
     }
 
     #[derive(Clone, Default)]
@@ -428,6 +551,32 @@ mod tests {
             }))
         }
 
+        type QueryTicketsStream = tokio_stream::Iter<
+            std::vec::IntoIter<Result<crate::clients::custodian::Ticket, tonic::Status>>,
+        >;
+        async fn query_tickets(
+            &self,
+            _req: tonic::Request<crate::clients::custodian::QueryTicketsRequest>,
+        ) -> Result<tonic::Response<Self::QueryTicketsStream>, tonic::Status> {
+            let tickets = vec![
+                Ok(crate::clients::custodian::Ticket {
+                    ticket_id: 1,
+                    title: "First".to_string(),
+                    project: "InfoVulcan".to_string(),
+                    status: 1,
+                    ..Default::default()
+                }),
+                Ok(crate::clients::custodian::Ticket {
+                    ticket_id: 2,
+                    title: "Second".to_string(),
+                    project: "InfoVulcan".to_string(),
+                    status: 1,
+                    ..Default::default()
+                }),
+            ];
+            Ok(tonic::Response::new(tokio_stream::iter(tickets)))
+        }
+
         async fn health(
             &self,
             _req: tonic::Request<crate::clients::custodian::HealthRequest>,
@@ -441,7 +590,9 @@ mod tests {
             _req: tonic::Request<crate::clients::custodian::ClusterStatusRequest>,
         ) -> Result<tonic::Response<crate::clients::custodian::ClusterStatusResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not needed"))
+            Ok(tonic::Response::new(
+                crate::clients::custodian::ClusterStatusResponse::default(),
+            ))
         }
     }
 
@@ -596,10 +747,10 @@ mod tests {
         )
         .await;
         let _ = shutdown.send(());
-        let Err((status, _)) = result else {
+        let Err(err) = result else {
             panic!("expected error response when credentials denied");
         };
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -619,10 +770,10 @@ mod tests {
         )
         .await;
         let _ = shutdown.send(());
-        let Err((status, _)) = result else {
+        let Err(err) = result else {
             panic!("expected error when backend returns Unauthenticated");
         };
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -642,10 +793,10 @@ mod tests {
         )
         .await;
         let _ = shutdown.send(());
-        let Err((status, _)) = result else {
+        let Err(err) = result else {
             panic!("expected error when backend returns InvalidArgument");
         };
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -714,6 +865,54 @@ mod tests {
         .await;
         let _ = shutdown.send(());
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_tickets_returns_tickets_from_backend() {
+        let (addr, shutdown) = start_mock_custodian(MockCustodianSvc);
+        let ch = connect_retry(addr).await;
+        let result = list_tickets(
+            State(make_state_with_custodian_ch(ch)),
+            Query(ListTicketsParams {
+                status: Some(1),
+                assignee: None,
+                account: None,
+                project: None,
+                include_deleted: None,
+                limit: None,
+            }),
+        )
+        .await;
+        let _ = shutdown.send(());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn health_reports_ok_when_custodian_reachable() {
+        let (addr, shutdown) = start_mock_custodian(MockCustodianSvc);
+        let ch = connect_retry(addr).await;
+        let resp = health(State(make_state_with_custodian_ch(ch)))
+            .await
+            .into_response();
+        let _ = shutdown.send(());
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_reports_degraded_when_custodian_unreachable() {
+        // Lazy channel to a dead port: cluster_status fails -> degraded/503.
+        let resp = health(State(test_state())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn api_error_maps_grpc_codes_and_renders_envelope() {
+        use crate::error::ApiError;
+        let err = ApiError::from(tonic::Status::not_found("missing"));
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.code, "not_found");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ===== Existing tests =====
@@ -1009,9 +1208,9 @@ mod tests {
         )
         .await;
         let _ = shutdown.send(());
-        let Err((status, _)) = result else {
+        let Err(err) = result else {
             panic!("expected error when backend returns Internal");
         };
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
