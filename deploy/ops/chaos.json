@@ -1,5 +1,4 @@
 {
-  "_comment": "NanoVMs OPS image config for the InfoVulcan chaos service (fault injection; Hardened only). Gate it with CHAOS_AUTH_TOKEN in any non-lab deployment. UNVALIDATED template — see deploy/README.md.",
   "Args": [],
   "Env": {
     "LISTEN_ADDR": "0.0.0.0:8084",
@@ -12,7 +11,7 @@
     "RUST_LOG": "info"
   },
   "MapDirs": {
-    "/etc/infovulcan/certs": "./certs/chaos"
+    "./certs/chaos": "/etc/infovulcan/certs"
   },
   "RunConfig": {
     "Ports": ["8084"],

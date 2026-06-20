@@ -242,37 +242,18 @@ impl RaftNetwork<DbTypeConfig> for DbNetwork {
                 ))
             })?;
 
-            // Decode the typed response: 0=Success, 1=PartialSuccess, 2=Conflict, 3=HigherVote.
-            let append_response = match resp.response_type {
-                0 => openraft::raft::AppendEntriesResponse::Success,
-                1 => openraft::raft::AppendEntriesResponse::PartialSuccess(
-                    resp.partial_success_index.map(|log_id| openraft::LogId {
-                        leader_id: openraft::LeaderId {
-                            term: log_id.term,
-                            node_id: proto_vote.node_id,
-                        },
-                        index: log_id.index,
-                    }),
-                ),
-                2 => openraft::raft::AppendEntriesResponse::Conflict,
-                3 => openraft::raft::AppendEntriesResponse::HigherVote(openraft::Vote {
-                    leader_id: openraft::LeaderId {
-                        term: proto_vote.term,
-                        node_id: proto_vote.node_id,
-                    },
-                    committed: proto_vote.committed,
-                }),
-                other => {
-                    return Err(openraft::error::RPCError::Network(
-                        openraft::error::NetworkError::new(&std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown append_entries response_type: {other}"),
-                        )),
-                    ));
-                }
-            };
-
-            Ok(append_response)
+            // Decode the typed response (0=Success, 1=PartialSuccess, 2=Conflict, 3=HigherVote)
+            // via the shared wire codec.
+            raft_rpc::append_response_from_wire(
+                resp.response_type,
+                resp.partial_success_index.map(|l| (l.term, l.index)),
+                (proto_vote.term, proto_vote.node_id, proto_vote.committed),
+            )
+            .map_err(|msg| {
+                openraft::error::RPCError::Network(openraft::error::NetworkError::new(
+                    &std::io::Error::new(std::io::ErrorKind::InvalidData, msg),
+                ))
+            })
         }
     }
 

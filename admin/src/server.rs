@@ -6,8 +6,6 @@ use db::database_client::DatabaseClient;
 use db::{GetRequest, PutRequest};
 use shared::encryption::EncryptionService;
 use shared::user::{AuthMethod, Role, User, UserAuth};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -23,13 +21,15 @@ use admin::{
 use chrono::Utc;
 
 pub struct AdminServiceImpl {
-    db_client: Arc<Mutex<DatabaseClient<tonic::transport::Channel>>>,
+    // tonic clients are cheaply clonable handles over a multiplexing `Channel`; store one directly
+    // and `.clone()` per call rather than serializing every RPC through an `Arc<Mutex<…>>`.
+    db_client: DatabaseClient<tonic::transport::Channel>,
     encryption_keys: (Vec<u8>, Vec<u8>), // (public, private)
 }
 
 impl AdminServiceImpl {
     pub fn new(
-        db_client: Arc<Mutex<DatabaseClient<tonic::transport::Channel>>>,
+        db_client: DatabaseClient<tonic::transport::Channel>,
         encryption_keys: (Vec<u8>, Vec<u8>),
     ) -> Self {
         Self {
@@ -228,7 +228,7 @@ impl AdminService for AdminServiceImpl {
         // user:{id} -> User struct
         // auth:{username} -> UserAuth struct (encrypted) - Wait, auth service needs to look up by username
 
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
 
         // Store User Profile
         client
@@ -271,7 +271,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetUserRequest>,
     ) -> Result<Response<GetUserResponse>, Status> {
         let req = request.into_inner();
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
 
         let resp = client
             .get(GetRequest {
@@ -317,7 +317,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
         let req = request.into_inner();
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
 
         let items = client
             .list(db::ListRequest {
@@ -366,7 +366,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<UpdateUserRequest>,
     ) -> Result<Response<UpdateUserResponse>, Status> {
         let req = request.into_inner();
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
 
         // Load the existing profile.
         let resp = client
@@ -421,7 +421,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<DeleteUserRequest>,
     ) -> Result<Response<DeleteUserResponse>, Status> {
         let req = request.into_inner();
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
 
         // Soft delete only (audit trail requirement): deactivate, never hard-delete.
         let resp = client
@@ -479,8 +479,7 @@ impl AdminService for AdminServiceImpl {
         let value = prost::Message::encode_to_vec(&event);
         if let Err(e) = self
             .db_client
-            .lock()
-            .await
+            .clone()
             .put(PutRequest {
                 collection: "audit".to_string(),
                 key,
@@ -711,10 +710,7 @@ mod tests {
 
     fn make_service() -> AdminServiceImpl {
         let keys = EncryptionService::generate_keypair().expect("keypair");
-        AdminServiceImpl::new(
-            Arc::new(Mutex::new(DatabaseClient::new(make_lazy_channel()))),
-            keys,
-        )
+        AdminServiceImpl::new(DatabaseClient::new(make_lazy_channel()), keys)
     }
 
     // ── map_role ──────────────────────────────────────────────────────────────
@@ -784,7 +780,7 @@ mod tests {
             values: store.clone(),
         });
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         let ack = svc
             .record_intrusion(Request::new(IntrusionEvent {
@@ -831,7 +827,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         seed_user(&svc, "alice", 0).await;
         seed_user(&svc, "bob", 3).await;
@@ -871,7 +867,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         let id = seed_user(&svc, "dave", 3).await;
 
@@ -911,7 +907,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         let err = svc
             .update_user(Request::new(UpdateUserRequest {
@@ -933,7 +929,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         let id = seed_user(&svc, "erin", 3).await;
 
@@ -1012,7 +1008,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys.clone());
+        let svc = AdminServiceImpl::new(db_client, keys.clone());
 
         let create_resp = svc
             .create_user(Request::new(CreateUserRequest {
@@ -1062,7 +1058,7 @@ mod tests {
             values: Arc::new(RwLock::new(map)),
         });
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         let get_resp = svc
             .get_user(Request::new(GetUserRequest {
@@ -1083,7 +1079,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_retry(addr).await;
-        let svc = AdminServiceImpl::new(Arc::new(Mutex::new(db_client)), keys);
+        let svc = AdminServiceImpl::new(db_client, keys);
 
         let err = svc
             .get_user(Request::new(GetUserRequest {

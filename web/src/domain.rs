@@ -45,6 +45,16 @@ pub const PRIORITIES: &[(i32, &str)] = &[
     (5, "Packet Loss"),
 ];
 
+/// All user roles as `(value, label)` (mirror of `admin` proto `Role` / `shared::user::Role`).
+pub const ROLES: &[(i32, &str)] = &[
+    (0, "Admin"),
+    (1, "Manager"),
+    (2, "Supervisor"),
+    (3, "Technician"),
+    (4, "Ebond Partner"),
+    (5, "Read Only"),
+];
+
 /// Human-readable label for a status value (falls back to the raw number).
 #[must_use]
 pub fn status_label(value: i32) -> String {

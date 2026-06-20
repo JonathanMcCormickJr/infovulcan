@@ -17,6 +17,8 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "syn
 tonic = "0.14"
 prost = "0.14"
 prost-types = "0.14"
+# Lock-free atomic swap of the backend clients on services.toml reload (no per-RPC mutex).
+arc-swap = "1"
 
 # HTTP utilities
 hyper = { version = "1.0", features = ["http1", "http2", "server"] }
@@ -52,4 +54,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = "3.23"
 tokio-stream = "0.1"
+test-support = { path = "../test-support" }
 

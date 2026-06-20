@@ -2,8 +2,6 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use shared::encryption::EncryptionService;
 use shared::user::{User, UserAuth};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -24,14 +22,16 @@ struct Claims {
 }
 
 pub struct AuthServiceImpl {
-    db_client: Arc<Mutex<DatabaseClient<tonic::transport::Channel>>>,
+    // tonic clients are cheaply clonable handles over a multiplexing `Channel`; store one directly
+    // and `.clone()` per call rather than serializing every RPC through an `Arc<Mutex<…>>`.
+    db_client: DatabaseClient<tonic::transport::Channel>,
     jwt_secret: Vec<u8>,
     encryption_keys: (Vec<u8>, Vec<u8>), // (public, private)
 }
 
 impl AuthServiceImpl {
     pub fn new(
-        db_client: Arc<Mutex<DatabaseClient<tonic::transport::Channel>>>,
+        db_client: DatabaseClient<tonic::transport::Channel>,
         jwt_secret: Vec<u8>,
         encryption_keys: (Vec<u8>, Vec<u8>),
     ) -> Self {
@@ -43,7 +43,7 @@ impl AuthServiceImpl {
     }
 
     async fn get_user_auth(&self, username: &str) -> Result<Option<UserAuth>, Status> {
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
         let key = format!("auth:username:{username}").into_bytes();
 
         let resp = client
@@ -75,7 +75,7 @@ impl AuthServiceImpl {
     }
 
     async fn get_user_profile(&self, user_id: Uuid) -> Result<Option<User>, Status> {
-        let mut client = self.db_client.lock().await;
+        let mut client = self.db_client.clone();
         let key = user_id.as_bytes().to_vec();
 
         let resp = client
@@ -123,12 +123,13 @@ fn verify_totp(secret: &str, token: &str) -> Result<bool, Status> {
 
 #[tonic::async_trait]
 impl AuthService for AuthServiceImpl {
+    // `skip_all` keeps the password/MFA token out of logs; `username` is recorded as a span field.
+    #[tracing::instrument(skip_all, fields(username = request.get_ref().username))]
     async fn authenticate(
         &self,
         request: Request<AuthenticateRequest>,
     ) -> Result<Response<AuthenticateResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Authenticating user: {}", req.username);
 
         // 1. Fetch UserAuth
         let user_auth = match self.get_user_auth(&req.username).await {
@@ -202,11 +203,12 @@ impl AuthService for AuthServiceImpl {
             return Err(Status::internal("User profile missing for valid auth"));
         };
 
-        // 5. Generate JWT
+        // 5. Generate JWT. Compute the 24h expiry without panicking on the (practically
+        // impossible) overflow — this is a request path, so surface a clean error instead.
         let expiration = usize::try_from(
             chrono::Utc::now()
                 .checked_add_signed(chrono::Duration::hours(24))
-                .expect("valid timestamp")
+                .ok_or_else(|| Status::internal("token expiry timestamp overflow"))?
                 .timestamp(),
         )
         .unwrap_or(0);
@@ -242,6 +244,8 @@ impl AuthService for AuthServiceImpl {
         }))
     }
 
+    // `skip_all` keeps the session token out of logs.
+    #[tracing::instrument(skip_all)]
     async fn validate_session(
         &self,
         request: Request<ValidateSessionRequest>,
@@ -336,7 +340,6 @@ mod tests {
         assert!(verify_totp("not!base32!", "123456").is_err());
     }
     use std::sync::Arc;
-    use tokio::sync::Mutex;
     use tokio::sync::RwLock;
     use tokio::sync::oneshot;
     use tonic::transport::Channel;
@@ -538,7 +541,7 @@ mod tests {
         let channel = Channel::from_static("http://127.0.0.1:9").connect_lazy();
         let client = DatabaseClient::new(channel);
         AuthServiceImpl::new(
-            Arc::new(Mutex::new(client)),
+            client,
             b"secret-for-tests".to_vec(),
             (vec![0; 1184], vec![0; 2400]),
         )
@@ -646,11 +649,7 @@ mod tests {
         let (addr, shutdown) = start_mock_db(mock_db);
 
         let db_client = connect_mock_db_with_retry(addr).await;
-        let svc = AuthServiceImpl::new(
-            Arc::new(Mutex::new(db_client)),
-            b"jwt-secret".to_vec(),
-            keys,
-        );
+        let svc = AuthServiceImpl::new(db_client, b"jwt-secret".to_vec(), keys);
 
         let auth = svc
             .authenticate(Request::new(AuthenticateRequest {
@@ -686,11 +685,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_mock_db_with_retry(addr).await;
-        let svc = AuthServiceImpl::new(
-            Arc::new(Mutex::new(db_client)),
-            b"jwt-secret".to_vec(),
-            keys,
-        );
+        let svc = AuthServiceImpl::new(db_client, b"jwt-secret".to_vec(), keys);
 
         let auth = svc
             .authenticate(Request::new(AuthenticateRequest {
@@ -715,11 +710,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db(MockDb::default());
         let db_client = connect_mock_db_with_retry(addr).await;
-        let svc = AuthServiceImpl::new(
-            Arc::new(Mutex::new(db_client)),
-            b"jwt-secret".to_vec(),
-            keys,
-        );
+        let svc = AuthServiceImpl::new(db_client, b"jwt-secret".to_vec(), keys);
 
         let user_id = Uuid::new_v4();
         let claims = Claims {
@@ -788,11 +779,7 @@ mod tests {
             values: Arc::new(RwLock::new(map)),
         });
         let db_client = connect_mock_db_with_retry(addr).await;
-        let svc = AuthServiceImpl::new(
-            Arc::new(Mutex::new(db_client)),
-            b"jwt-secret".to_vec(),
-            keys,
-        );
+        let svc = AuthServiceImpl::new(db_client, b"jwt-secret".to_vec(), keys);
 
         let auth = svc
             .authenticate(Request::new(AuthenticateRequest {
@@ -930,11 +917,7 @@ mod tests {
         let keys = EncryptionService::generate_keypair().expect("keypair");
         let (addr, shutdown) = start_mock_db_impl::<ErrorDb>(ErrorDb);
         let db_client = connect_mock_db_with_retry(addr).await;
-        let svc = AuthServiceImpl::new(
-            Arc::new(Mutex::new(db_client)),
-            b"jwt-secret".to_vec(),
-            keys,
-        );
+        let svc = AuthServiceImpl::new(db_client, b"jwt-secret".to_vec(), keys);
 
         let err = svc
             .authenticate(Request::new(AuthenticateRequest {
@@ -980,11 +963,7 @@ mod tests {
             values: Arc::new(RwLock::new(map)),
         });
         let db_client = connect_mock_db_with_retry(addr).await;
-        let svc = AuthServiceImpl::new(
-            Arc::new(Mutex::new(db_client)),
-            b"jwt-secret".to_vec(),
-            keys,
-        );
+        let svc = AuthServiceImpl::new(db_client, b"jwt-secret".to_vec(), keys);
 
         let err = svc
             .authenticate(Request::new(AuthenticateRequest {

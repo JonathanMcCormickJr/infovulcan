@@ -7,8 +7,6 @@ use server::auth::auth_service_server::AuthServiceServer;
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -72,7 +70,6 @@ async fn main() -> Result<()> {
     info!("Connecting to DB at {}", db_addr);
     let channel = proto::tls::connect(&db_addr).await?;
     let db_client = server::db::database_client::DatabaseClient::new(channel);
-    let db_client = Arc::new(Mutex::new(db_client));
 
     // Create service
     let auth_service = AuthServiceImpl::new(db_client, jwt_secret, keys);

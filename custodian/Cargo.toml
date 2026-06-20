@@ -17,6 +17,8 @@ prost-types = "0.14"
 
 # Raft consensus
 openraft = { version = "0.9", features = ["serde"] }
+# Shared openraft<->wire conversion helpers (de-dups db & custodian Raft RPC glue).
+raft-rpc = { path = "../raft-rpc" }
 
 # Storage backend
 sled = "0.34"

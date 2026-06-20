@@ -66,7 +66,7 @@ pub struct ReloadableClients {
 ///
 /// Returns the set of services that were redirected (so callers can log/assert). A failed
 /// reconnect is logged and the old channel is kept (the service name is *not* returned).
-pub async fn apply_changes(
+pub fn apply_changes(
     current: &BackendAddrs,
     next: &BackendAddrs,
     clients: &ReloadableClients,
@@ -74,7 +74,7 @@ pub async fn apply_changes(
     let mut changed = Vec::new();
 
     if current.auth != next.auth {
-        match clients.auth.reconnect(&next.auth).await {
+        match clients.auth.reconnect(&next.auth) {
             Ok(()) => {
                 info!(service = "auth", addr = %next.auth, "discovery: reconnected");
                 changed.push("auth");
@@ -85,7 +85,7 @@ pub async fn apply_changes(
         }
     }
     if current.admin != next.admin {
-        match clients.admin.reconnect(&next.admin).await {
+        match clients.admin.reconnect(&next.admin) {
             Ok(()) => {
                 info!(service = "admin", addr = %next.admin, "discovery: reconnected");
                 changed.push("admin");
@@ -96,7 +96,7 @@ pub async fn apply_changes(
         }
     }
     if current.custodian != next.custodian {
-        match clients.custodian.reconnect(&next.custodian).await {
+        match clients.custodian.reconnect(&next.custodian) {
             Ok(()) => {
                 info!(service = "custodian", addr = %next.custodian, "discovery: reconnected");
                 changed.push("custodian");
@@ -114,18 +114,14 @@ pub async fn apply_changes(
 /// hot-reconnect the changed clients. Returns the endpoints in effect after this tick (the new
 /// set on success+change, otherwise `current` unchanged). A read/parse failure is logged and
 /// keeps the current endpoints.
-pub async fn reload_once(
-    path: &str,
-    current: BackendAddrs,
-    clients: &ReloadableClients,
-) -> BackendAddrs {
+pub fn reload_once(path: &str, current: BackendAddrs, clients: &ReloadableClients) -> BackendAddrs {
     match ServiceRegistry::load(path) {
         Ok(reg) => {
             let next = BackendAddrs::from_env_registry(&reg);
             if next == current {
                 return current;
             }
-            let changed = apply_changes(&current, &next, clients).await;
+            let changed = apply_changes(&current, &next, clients);
             if !changed.is_empty() {
                 info!(?changed, "discovery: applied services.toml changes");
             }
@@ -152,7 +148,7 @@ pub fn spawn_reloader(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            current = reload_once(&path, current, &clients).await;
+            current = reload_once(&path, current, &clients);
         }
     });
 }
@@ -199,27 +195,11 @@ mod tests {
     }
 
     fn lazy_clients() -> ReloadableClients {
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
         let lazy = || proto::tls::connect_lazy("http://127.0.0.1:9").unwrap();
         ReloadableClients {
-            auth: AuthClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::auth::auth_service_client::AuthServiceClient::new(lazy()),
-                )),
-            },
-            admin: AdminClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::admin::admin_service_client::AdminServiceClient::new(lazy()),
-                )),
-            },
-            custodian: CustodianClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::custodian::custodian_service_client::CustodianServiceClient::new(
-                        lazy(),
-                    ),
-                )),
-            },
+            auth: AuthClient::from_channel(lazy()),
+            admin: AdminClient::from_channel(lazy()),
+            custodian: CustodianClient::from_channel(lazy()),
         }
     }
 
@@ -233,7 +213,7 @@ mod tests {
         };
         // No differences → no reconnect attempts → empty result.
         let same = current.clone();
-        assert!(apply_changes(&current, &same, &clients).await.is_empty());
+        assert!(apply_changes(&current, &same, &clients).is_empty());
     }
 
     #[tokio::test]
@@ -249,7 +229,7 @@ mod tests {
             auth: "http://127.0.0.1:9".to_string(),
             ..current.clone()
         };
-        let changed = apply_changes(&current, &next, &clients).await;
+        let changed = apply_changes(&current, &next, &clients);
         assert_eq!(changed, vec!["auth"]);
     }
 
@@ -266,7 +246,7 @@ mod tests {
             admin: "http://127.0.0.1:10".to_string(),
             custodian: "http://127.0.0.1:11".to_string(),
         };
-        let changed = apply_changes(&current, &next, &clients).await;
+        let changed = apply_changes(&current, &next, &clients);
         assert_eq!(changed, vec!["auth", "admin", "custodian"]);
     }
 
@@ -291,7 +271,7 @@ mod tests {
             admin: BackendAddrs::DEFAULT_ADMIN.to_string(),
             custodian: BackendAddrs::DEFAULT_CUSTODIAN.to_string(),
         };
-        let next = reload_once(path.to_str().unwrap(), current, &clients).await;
+        let next = reload_once(path.to_str().unwrap(), current, &clients);
         // auth was redirected to the file's value; the others fell back to defaults (unchanged).
         assert_eq!(next.auth, "http://127.0.0.1:9");
     }
@@ -304,7 +284,7 @@ mod tests {
             admin: "http://keep:2".to_string(),
             custodian: "http://keep:3".to_string(),
         };
-        let next = reload_once("/no/such/services.toml", current.clone(), &clients).await;
+        let next = reload_once("/no/such/services.toml", current.clone(), &clients);
         assert_eq!(next, current);
     }
 
@@ -320,7 +300,7 @@ mod tests {
             admin: BackendAddrs::DEFAULT_ADMIN.to_string(),
             custodian: BackendAddrs::DEFAULT_CUSTODIAN.to_string(),
         };
-        let next = reload_once(path.to_str().unwrap(), current.clone(), &clients).await;
+        let next = reload_once(path.to_str().unwrap(), current.clone(), &clients);
         assert_eq!(next, current);
     }
 
@@ -338,7 +318,7 @@ mod tests {
             admin: "::::bad uri::::".to_string(),
             custodian: "::::bad uri::::".to_string(),
         };
-        let changed = apply_changes(&current, &next, &clients).await;
+        let changed = apply_changes(&current, &next, &clients);
         assert!(changed.is_empty());
     }
 

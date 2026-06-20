@@ -21,14 +21,14 @@ impl Drop for ServiceProcess {
 }
 
 async fn wait_for_port(port: u16) -> Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             return Ok(());
         }
         sleep(Duration::from_millis(200)).await;
     }
-    Err(anyhow::anyhow!("Timed out waiting for port {}", port))
+    Err(anyhow::anyhow!("Timed out waiting for port {port}"))
 }
 
 fn build_service_binary(bin: &str) -> Result<()> {
@@ -53,11 +53,11 @@ fn build_service_binary(bin: &str) -> Result<()> {
 }
 
 fn start_service(name: &str, bin: &str, env: Vec<(&str, &str)>) -> Result<ServiceProcess> {
-    let exe_path = format!("../target/debug/{}", bin);
+    let exe_path = format!("../target/debug/{bin}");
     let child = Command::new(&exe_path)
         .envs(env)
         .spawn()
-        .context(format!("Failed to start {}", name))?;
+        .context(format!("Failed to start {name}"))?;
 
     println!("Started {} (pid {})", name, child.id());
     Ok(ServiceProcess {
@@ -191,12 +191,12 @@ async fn test_e2e_flow() -> Result<()> {
     assert_eq!(login_resp.status(), 200);
     let login_body: serde_json::Value = login_resp.json().await?;
     let token = login_body["token"].as_str().context("missing token")?;
-    println!("Got token: {}", token);
+    println!("Got token: {token}");
 
     // C. Create Ticket via LBRP (HTTP)
     let ticket_resp = client
         .post("http://127.0.0.1:8080/api/tickets")
-        .header("Authorization", format!("Bearer {}", token))
+        .header("Authorization", format!("Bearer {token}"))
         .json(&json!({
             "title": "System Down",
             "project": "Internal",
@@ -211,8 +211,7 @@ async fn test_e2e_flow() -> Result<()> {
     let ticket_body = ticket_resp.text().await?;
     assert_eq!(
         ticket_status, 201,
-        "unexpected create ticket response: status={}, body={}",
-        ticket_status, ticket_body
+        "unexpected create ticket response: status={ticket_status}, body={ticket_body}"
     );
     let created: serde_json::Value = serde_json::from_str(&ticket_body)?;
     let ticket_id = created["ticket_id"]

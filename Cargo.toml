@@ -9,9 +9,9 @@ members = [
     "honeypot",
     "lbrp",
     "proto",
+    "raft-rpc",
     "shared",
-    "spikes/raft-toy",
-    "spikes/tonic-mtls",
+    "test-support",
     "tests",
     "web",
 ]

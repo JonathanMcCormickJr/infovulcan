@@ -4,10 +4,32 @@ InfoVulcan's Hardened topology deploys each service as its own **NanoVMs OPS uni
 single Rust binary booting directly on a hypervisor with no shell, package manager, or
 multi-process surface. This is the minimal-attack-surface model from `ARCHITECTURE.md` (no Docker).
 
-> ⚠️ **Unvalidated artifacts.** The configs in `deploy/ops/` and the images produced by
-> `scripts/build-images.sh` were authored in an environment that cannot build or boot a unikernel.
-> Treat them as a starting template: review every value and validate on a host with KVM + `ops`
-> before relying on them.
+> ✅ **Image build validated.** `scripts/build-images.sh` (with `CERTS_SRC` provisioning) creates
+> all 7 service images successfully via `ops image create`, and a single `db` image has been
+> observed to **boot and run** under `ops` (Sled storage init, openraft startup, gRPC server up).
+>
+> ⚠️ **Booting/clustering not fully validated.** Full multi-node bring-up (3-node Raft quorum,
+> mTLS peer mesh, lbrp→backends) requires a host with hardware virtualization (**KVM**) and proper
+> instance networking. Validate the boot order and cross-service connectivity there before relying
+> on it. (Without KVM, `ops` falls back to slow TCG emulation — fine for a single-binary smoke
+> test, impractical for a live cluster.)
+
+### OPS config conventions (do not regress)
+
+The `deploy/ops/*.json` files must obey several `ops` rules — violating them makes
+`ops image create` fail, sometimes with cryptic errors:
+
+- **No comment fields.** `ops` rejects unknown JSON keys (e.g. a `_comment` field →
+  `json: unknown field "_comment"`). Keep notes here in the README, not in the JSON.
+- **`MapDirs` is `"<host-source>": "<image-dest>"`.** The *key* is the host path (resolved
+  **relative to the config file's directory**, `deploy/ops/`), the *value* is the path inside the
+  image. Reversing it yields `lstat <image-path>: no such file or directory`.
+- **`MapDirs` host paths need ≥2 components.** A single-component host path like `./lbrp-conf`
+  fails with an empty `lstat : no such file or directory`; use a nested path like
+  `./lbrp-conf/infovulcan`. (This is why the lbrp `/etc/infovulcan` payload lives one level deep.)
+- **`Dirs` requires the host dir to exist.** The Raft services bake an empty `/data` via
+  `"Dirs": ["data"]`, so `deploy/ops/data/` must exist (tracked via `data/.gitkeep`;
+  `build-images.sh` also `mkdir -p`s it).
 
 ## Components
 
@@ -46,13 +68,14 @@ dev PKI and fan it out into the per-service cert directories the image configs e
 
 ```bash
 ./scripts/gen-certs.sh certs                 # writes flat ca/<svc> certs into ./certs
-CERTS_SRC=./certs ./scripts/build-images.sh  # provisions deploy/ops/certs/<svc>/ + lbrp-conf/certs/
+CERTS_SRC=certs ./scripts/build-images.sh    # provisions deploy/ops/certs/<svc>/ + lbrp-conf/infovulcan/certs/
 ```
 
-Each non-lbrp config maps `./certs/<svc>` → `/etc/infovulcan/certs`; lbrp maps `./lbrp-conf` →
-`/etc/infovulcan` (so its `certs/` **and** `services.toml` ride along). The generated cert dirs are
-git-ignored — never commit private keys. For production, replace the dev CA with your real PKI and
-ensure each certificate's SAN matches the DNS name used in `RAFT_PEERS` / `services.toml`.
+Each non-lbrp config maps `./certs/<svc>` → `/etc/infovulcan/certs`; lbrp maps
+`./lbrp-conf/infovulcan` → `/etc/infovulcan` (so its `certs/` **and** `services.toml` ride along).
+The generated cert dirs are git-ignored — never commit private keys. For production, replace the
+dev CA with your real PKI and ensure each certificate's SAN matches the DNS name used in
+`RAFT_PEERS` / `services.toml`.
 
 ## 2. Set secrets
 
@@ -94,7 +117,7 @@ baked into the shared config.
 
 ## Static discovery & hot reload
 
-lbrp reads `/etc/infovulcan/services.toml` (baked from `deploy/ops/lbrp-conf/services.toml`) and
+lbrp reads `/etc/infovulcan/services.toml` (baked from `deploy/ops/lbrp-conf/infovulcan/services.toml`) and
 re-reads it every `SERVICES_RELOAD_SECS` (default 30s), hot-reconnecting any backend whose endpoint
 changed — no lbrp restart needed to repoint traffic. Per-service env vars (`AUTH_ADDR`,
 `ADMIN_ADDR`, `CUSTODIAN_ADDR`) still override the file.

@@ -1,5 +1,6 @@
 use crate::api::{
-    self, CreateTicketRequest, CreateUserRequest, ListTicketsFilter, Ticket, UpdateTicketRequest,
+    self, CreateTicketRequest, CreateUserRequest, ListTicketsFilter, NextActionInput, Ticket,
+    UpdateTicketRequest,
 };
 use crate::domain;
 use crate::theme;
@@ -35,6 +36,11 @@ pub fn TicketList() -> impl IntoView {
     let (update_project, set_update_project) = create_signal(String::new());
     let (update_priority, set_update_priority) = create_signal(String::new());
     let (update_status, set_update_status) = create_signal(String::new());
+    // Next-action editor: kind is one of "unchanged" | "none" | "follow_up" | "appointment"
+    // | "auto_close". "unchanged" omits the field; the others set/clear it.
+    let (update_na_kind, set_update_na_kind) = create_signal("unchanged".to_string());
+    let (update_na_at, set_update_na_at) = create_signal(String::new());
+    let (update_na_schedule, set_update_na_schedule) = create_signal("end_of_day".to_string());
 
     // ── Create ticket ─────────────────────────────────────────────────────────
     let (new_title, set_new_title) = create_signal(String::new());
@@ -77,6 +83,22 @@ pub fn TicketList() -> impl IntoView {
         set_update_project.set(t.project.clone());
         set_update_priority.set(t.priority.to_string());
         set_update_status.set(t.status.to_string());
+        // Reflect the ticket's current next action into the editor (defaults to "unchanged").
+        match &t.next_action {
+            Some(api::NextAction::FollowUp { at }) => {
+                set_update_na_kind.set("follow_up".to_string());
+                set_update_na_at.set(at.to_string());
+            }
+            Some(api::NextAction::Appointment { at }) => {
+                set_update_na_kind.set("appointment".to_string());
+                set_update_na_at.set(at.to_string());
+            }
+            Some(api::NextAction::AutoClose { schedule }) => {
+                set_update_na_kind.set("auto_close".to_string());
+                set_update_na_schedule.set(schedule.clone());
+            }
+            None => set_update_na_kind.set("unchanged".to_string()),
+        }
         set_ticket.set(Some(t));
     };
 
@@ -100,7 +122,7 @@ pub fn TicketList() -> impl IntoView {
             spawn_local(async move {
                 match api::fetch_ticket(&token, ticket_id).await {
                     Ok(found) => load_into_form(found),
-                    Err(err) => set_error.set(err),
+                    Err(err) => set_error.set(err.to_string()),
                 }
             });
         }
@@ -133,7 +155,7 @@ pub fn TicketList() -> impl IntoView {
                         set_message.set(format!("Found {} ticket(s).", list.len()));
                         set_tickets.set(list);
                     }
-                    Err(err) => set_error.set(err),
+                    Err(err) => set_error.set(err.to_string()),
                 }
             });
         }
@@ -169,7 +191,7 @@ pub fn TicketList() -> impl IntoView {
                         set_update_status.set(created.status.to_string());
                         set_ticket.set(Some(created));
                     }
-                    Err(err) => set_error.set(err),
+                    Err(err) => set_error.set(err.to_string()),
                 }
             });
         }
@@ -217,11 +239,34 @@ pub fn TicketList() -> impl IntoView {
                 }
             }
 
+            // Build the optional next-action change. "unchanged" omits the field entirely;
+            // the timestamp variants require a valid unix-seconds integer.
+            let next_action = match update_na_kind.get().as_str() {
+                "none" => Some(NextActionInput::None),
+                "follow_up" | "appointment" => {
+                    let Ok(at) = update_na_at.get().trim().parse::<i64>() else {
+                        set_error
+                            .set("Next-action time must be a unix-seconds integer.".to_string());
+                        return;
+                    };
+                    if update_na_kind.get() == "follow_up" {
+                        Some(NextActionInput::FollowUp { at })
+                    } else {
+                        Some(NextActionInput::Appointment { at })
+                    }
+                }
+                "auto_close" => Some(NextActionInput::AutoClose {
+                    schedule: update_na_schedule.get(),
+                }),
+                _ => None, // "unchanged"
+            };
+
             let payload = UpdateTicketRequest {
                 title: (!update_title.get().trim().is_empty()).then(|| update_title.get()),
                 project: (!update_project.get().trim().is_empty()).then(|| update_project.get()),
                 priority,
                 status,
+                next_action,
             };
             set_error.set(String::new());
             set_message.set(String::new());
@@ -232,7 +277,7 @@ pub fn TicketList() -> impl IntoView {
                         set_message.set(format!("Ticket #{} updated.", updated.ticket_id));
                         set_ticket.set(Some(updated));
                     }
-                    Err(err) => set_error.set(err),
+                    Err(err) => set_error.set(err.to_string()),
                 }
             });
         }
@@ -261,7 +306,7 @@ pub fn TicketList() -> impl IntoView {
             spawn_local(async move {
                 match api::create_user(&token, &payload).await {
                     Ok(()) => set_message.set("User created successfully.".to_string()),
-                    Err(err) => set_error.set(err),
+                    Err(err) => set_error.set(err.to_string()),
                 }
             });
         }
@@ -472,6 +517,36 @@ pub fn TicketList() -> impl IntoView {
                         }).collect_view()}
                     </select>
                 </div>
+                <div class="input-group">
+                    <label for="update-next-action">"Next action"</label>
+                    <select id="update-next-action" prop:value=update_na_kind
+                        on:change=move |ev| set_update_na_kind.set(event_target_value(&ev))>
+                        <option value="unchanged">"Leave unchanged"</option>
+                        <option value="none">"Clear (none)"</option>
+                        <option value="follow_up">"Follow up"</option>
+                        <option value="appointment">"Appointment"</option>
+                        <option value="auto_close">"Auto-close"</option>
+                    </select>
+                </div>
+                {move || matches!(update_na_kind.get().as_str(), "follow_up" | "appointment").then(|| view! {
+                    <div class="input-group">
+                        <label for="update-na-at">"When (unix seconds)"</label>
+                        <input id="update-na-at" type="text" prop:value=update_na_at
+                            on:input=move |ev| set_update_na_at.set(event_target_value(&ev)) />
+                    </div>
+                })}
+                {move || (update_na_kind.get() == "auto_close").then(|| view! {
+                    <div class="input-group">
+                        <label for="update-na-schedule">"Auto-close schedule"</label>
+                        <select id="update-na-schedule" prop:value=update_na_schedule
+                            on:change=move |ev| set_update_na_schedule.set(event_target_value(&ev))>
+                            <option value="end_of_day">"End of day"</option>
+                            <option value="hours_24">"24 hours"</option>
+                            <option value="hours_48">"48 hours"</option>
+                            <option value="hours_72">"72 hours"</option>
+                        </select>
+                    </div>
+                })}
                 <button class="btn-primary" on:click=on_update_ticket>"Save Changes"</button>
             </section>
 
@@ -529,9 +604,13 @@ pub fn TicketList() -> impl IntoView {
                         on:input=move |ev| set_create_user_display_name.set(event_target_value(&ev)) />
                 </div>
                 <div class="input-group">
-                    <label for="new-user-role">"Role Enum"</label>
-                    <input id="new-user-role" type="text" prop:value=create_user_role
-                        on:input=move |ev| set_create_user_role.set(event_target_value(&ev)) />
+                    <label for="new-user-role">"Role"</label>
+                    <select id="new-user-role" prop:value=create_user_role
+                        on:change=move |ev| set_create_user_role.set(event_target_value(&ev))>
+                        {domain::ROLES.iter().map(|(v, label)| view! {
+                            <option value={v.to_string()}>{*label}</option>
+                        }).collect_view()}
+                    </select>
                 </div>
                 <button class="btn-primary" on:click=on_create_user>"Create User"</button>
             </section>

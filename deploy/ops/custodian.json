@@ -1,5 +1,4 @@
 {
-  "_comment": "NanoVMs OPS image config for the InfoVulcan custodian service (Raft, ticket locks). Hardened topology runs 3+ with distinct NODE_ID / RAFT_PEERS. UNVALIDATED template — see deploy/README.md.",
   "Args": [],
   "Env": {
     "NODE_ID": "1",
@@ -16,7 +15,7 @@
   },
   "Dirs": ["data"],
   "MapDirs": {
-    "/etc/infovulcan/certs": "./certs/custodian"
+    "./certs/custodian": "/etc/infovulcan/certs"
   },
   "RunConfig": {
     "Ports": ["8081"],

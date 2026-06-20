@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 
 const TOKEN_KEY: &str = "infovulcan_demo_token";
 
+/// Errors surfaced by the REST client. `Display` renders a user-facing message (the UI shows it
+/// directly), while the variants let callers distinguish a transport failure from a server-side
+/// rejection if they need to.
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    /// The request could not be sent / completed, or the response body could not be parsed.
+    #[error("network error: {0}")]
+    Transport(#[from] gloo_net::Error),
+    /// The server returned a non-success status; the payload is its error body.
+    #[error("{0}")]
+    Server(String),
+}
+
 /// A ticket's scheduled next action (read-only mirror of the REST `next_action` field).
 /// `None` (JSON `null`) means no action is scheduled.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -57,12 +70,26 @@ pub struct CreateTicketRequest {
     pub priority: i32,
 }
 
+/// Writable next action sent with a ticket update. Mirrors the LBRP REST input:
+/// `None` (the `none` variant) clears the action; omitting the field leaves it unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NextActionInput {
+    None,
+    FollowUp { at: i64 },
+    Appointment { at: i64 },
+    AutoClose { schedule: String },
+}
+
 #[derive(Serialize)]
 pub struct UpdateTicketRequest {
     pub title: Option<String>,
     pub project: Option<String>,
     pub priority: Option<i32>,
     pub status: Option<i32>,
+    /// Omitted from the request body when `None` → the backend leaves the action unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<NextActionInput>,
 }
 
 #[derive(Serialize)]
@@ -94,68 +121,60 @@ fn set_token(token: &str) {
     }
 }
 
-pub async fn login(username: String, password: String) -> Result<(), String> {
+/// Read a non-success response's body as the server error message.
+async fn server_error(response: gloo_net::http::Response, fallback: &str) -> ApiError {
+    ApiError::Server(
+        response
+            .text()
+            .await
+            .unwrap_or_else(|_| fallback.to_string()),
+    )
+}
+
+pub async fn login(username: String, password: String) -> Result<(), ApiError> {
     let payload = LoginRequest {
         username,
         password,
         mfa_token: None,
     };
 
-    let response = Request::post("/auth/login")
-        .json(&payload)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = Request::post("/auth/login").json(&payload)?.send().await?;
 
     if !response.ok() {
-        return Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Login failed".to_string()));
+        return Err(server_error(response, "Login failed").await);
     }
 
-    let login_response: LoginResponse = response.json().await.map_err(|e| e.to_string())?;
+    let login_response: LoginResponse = response.json().await?;
     set_token(&login_response.token);
     Ok(())
 }
 
-pub async fn create_user(token: &str, payload: &CreateUserRequest) -> Result<(), String> {
+pub async fn create_user(token: &str, payload: &CreateUserRequest) -> Result<(), ApiError> {
     let response = Request::post("/api/admin/users")
         .header("Authorization", &format!("Bearer {token}"))
-        .json(payload)
-        .map_err(|e| e.to_string())?
+        .json(payload)?
         .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
     if response.ok() {
         Ok(())
     } else {
-        Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "User creation failed".to_string()))
+        Err(server_error(response, "User creation failed").await)
     }
 }
 
-pub async fn create_ticket(token: &str, payload: &CreateTicketRequest) -> Result<Ticket, String> {
+pub async fn create_ticket(token: &str, payload: &CreateTicketRequest) -> Result<Ticket, ApiError> {
     let response = Request::post("/api/tickets")
         .header("Authorization", &format!("Bearer {token}"))
-        .json(payload)
-        .map_err(|e| e.to_string())?
+        .json(payload)?
         .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
     if !response.ok() {
-        return Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Ticket creation failed".to_string()));
+        return Err(server_error(response, "Ticket creation failed").await);
     }
 
-    response.json().await.map_err(|e| e.to_string())
+    Ok(response.json().await?)
 }
 
 /// Filters for the ticket list query (`GET /api/tickets`). Empty fields are omitted.
@@ -197,7 +216,10 @@ impl ListTicketsFilter {
     }
 }
 
-pub async fn list_tickets(token: &str, filter: &ListTicketsFilter) -> Result<Vec<Ticket>, String> {
+pub async fn list_tickets(
+    token: &str,
+    filter: &ListTicketsFilter,
+) -> Result<Vec<Ticket>, ApiError> {
     let query = filter.to_query_string();
     let url = if query.is_empty() {
         "/api/tickets".to_string()
@@ -208,57 +230,44 @@ pub async fn list_tickets(token: &str, filter: &ListTicketsFilter) -> Result<Vec
     let response = Request::get(&url)
         .header("Authorization", &format!("Bearer {token}"))
         .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
     if !response.ok() {
-        return Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Ticket list failed".to_string()));
+        return Err(server_error(response, "Ticket list failed").await);
     }
 
-    response.json().await.map_err(|e| e.to_string())
+    Ok(response.json().await?)
 }
 
-pub async fn fetch_ticket(token: &str, ticket_id: u64) -> Result<Ticket, String> {
+pub async fn fetch_ticket(token: &str, ticket_id: u64) -> Result<Ticket, ApiError> {
     let response = Request::get(&format!("/api/tickets/{ticket_id}"))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
     if !response.ok() {
-        return Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Ticket lookup failed".to_string()));
+        return Err(server_error(response, "Ticket lookup failed").await);
     }
 
-    response.json().await.map_err(|e| e.to_string())
+    Ok(response.json().await?)
 }
 
 pub async fn update_ticket(
     token: &str,
     ticket_id: u64,
     payload: &UpdateTicketRequest,
-) -> Result<Ticket, String> {
+) -> Result<Ticket, ApiError> {
     let response = Request::put(&format!("/api/tickets/{ticket_id}"))
         .header("Authorization", &format!("Bearer {token}"))
-        .json(payload)
-        .map_err(|e| e.to_string())?
+        .json(payload)?
         .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
     if !response.ok() {
-        return Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Ticket update failed".to_string()));
+        return Err(server_error(response, "Ticket update failed").await);
     }
 
-    response.json().await.map_err(|e| e.to_string())
+    Ok(response.json().await?)
 }
 
 #[cfg(test)]
@@ -293,6 +302,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(filter.to_query_string(), "");
+    }
+
+    #[test]
+    fn next_action_input_serializes_with_type_tag() {
+        let none = serde_json::to_string(&NextActionInput::None).expect("serialize");
+        assert_eq!(none, r#"{"type":"none"}"#);
+
+        let follow = serde_json::to_string(&NextActionInput::FollowUp { at: 42 }).expect("ser");
+        assert_eq!(follow, r#"{"type":"follow_up","at":42}"#);
+
+        let ac = serde_json::to_string(&NextActionInput::AutoClose {
+            schedule: "hours_24".to_string(),
+        })
+        .expect("ser");
+        assert_eq!(ac, r#"{"type":"auto_close","schedule":"hours_24"}"#);
+    }
+
+    #[test]
+    fn update_request_omits_next_action_when_unchanged() {
+        let req = UpdateTicketRequest {
+            title: Some("t".to_string()),
+            project: None,
+            priority: None,
+            status: None,
+            next_action: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            !json.contains("next_action"),
+            "next_action must be omitted when None, got: {json}"
+        );
     }
 
     #[test]

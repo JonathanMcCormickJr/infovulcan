@@ -16,8 +16,9 @@
 #   - The `ops` CLI (https://ops.city). Install: curl https://ops.city/get.sh -sSfL | sh
 #   - `trunk` (for the lbrp web bundle): cargo install trunk
 #
-# NOTE: This environment cannot itself boot a unikernel; the per-service configs in deploy/ops/
-# and the images this produces are UNVALIDATED. Run on a host with KVM + ops to validate.
+# NOTE: `ops image create` for all 7 services has been validated on a Linux host with ops
+# installed (images build successfully). Actually *booting* a unikernel needs KVM/virtualization
+# and has not been exercised here — run `ops instance create <image>` on a KVM-capable host.
 
 set -euo pipefail
 
@@ -50,13 +51,13 @@ fi
 
 # --- Optional: fan out a flat PKI into the per-service cert dirs --------------
 # scripts/gen-certs.sh writes a flat dir (ca.crt, <svc>.crt, <svc>.key). The image configs
-# expect deploy/ops/certs/<svc>/ (and deploy/ops/lbrp-conf/certs/ for lbrp). Set CERTS_SRC to
-# that flat dir to provision them here.
+# expect deploy/ops/certs/<svc>/ (and deploy/ops/lbrp-conf/infovulcan/certs/ for lbrp). Set
+# CERTS_SRC to that flat dir to provision them here, e.g. `CERTS_SRC=certs ./scripts/build-images.sh`.
 if [[ -n "${CERTS_SRC:-}" ]]; then
     echo "Provisioning per-service certs from $CERTS_SRC"
     for svc in "${ALL_SERVICES[@]}"; do
         if [[ "$svc" == lbrp ]]; then
-            dest="$OPS_DIR/lbrp-conf/certs"
+            dest="$OPS_DIR/lbrp-conf/infovulcan/certs"
         else
             dest="$OPS_DIR/certs/$svc"
         fi
@@ -64,6 +65,10 @@ if [[ -n "${CERTS_SRC:-}" ]]; then
         cp "$CERTS_SRC/ca.crt" "$CERTS_SRC/$svc.crt" "$CERTS_SRC/$svc.key" "$dest/"
     done
 fi
+
+# The Raft services bake an empty /data dir into the image via the config `Dirs` field, which
+# requires a host `deploy/ops/data` directory to exist. Tracked via data/.gitkeep, but ensure it.
+mkdir -p "$OPS_DIR/data"
 
 # --- Build release binaries ---------------------------------------------------
 if [[ "$skip_build" == false ]]; then
@@ -84,6 +89,7 @@ if [[ "$skip_build" == false ]]; then
 fi
 
 # --- Create one image per service ---------------------------------------------
+failures=()
 for svc in "${services[@]}"; do
     config="$OPS_DIR/$svc.json"
     binary="$BIN_DIR/$svc"
@@ -100,9 +106,20 @@ for svc in "${services[@]}"; do
 
     echo "==> Creating image '$image' from $binary"
     # `ops image create` bakes the ELF + config (env, ports, mapped dirs) into a bootable image.
-    ( cd "$OPS_DIR" && ops image create "$binary" -c "$svc.json" -i "$image" )
-    echo "    done: $image"
+    # Note: ops resolves MapDirs host paths relative to the config file's directory (deploy/ops),
+    # and those host paths must have >=2 components (an ops quirk) — see deploy/README.md.
+    if ( cd "$OPS_DIR" && ops image create "$binary" -c "$svc.json" -i "$image" ); then
+        echo "    done: $image"
+    else
+        echo "    FAILED: $image (see error above)"
+        failures+=("$svc")
+    fi
 done
+
+if [[ ${#failures[@]} -gt 0 ]]; then
+    echo "ERROR: image creation failed for: ${failures[*]}"
+    exit 1
+fi
 
 cat <<EOF
 

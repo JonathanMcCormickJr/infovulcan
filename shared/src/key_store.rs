@@ -97,7 +97,10 @@ mod tests {
         // A keys.bin that exists but isn't valid JSON → deserialization error path.
         fs::write(dir.path().join(KEYPAIR_FILENAME), b"not valid json").expect("write");
         let result = load_or_generate_keypair(dir.path());
-        assert!(result.is_err(), "corrupt keypair file must surface an error");
+        assert!(
+            result.is_err(),
+            "corrupt keypair file must surface an error"
+        );
     }
 
     #[test]

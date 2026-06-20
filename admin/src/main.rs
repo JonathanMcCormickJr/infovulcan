@@ -8,8 +8,6 @@ use server::admin::admin_service_server::AdminServiceServer;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tracing::info;
 
@@ -43,7 +41,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Connecting to DB at {}", db_addr);
     let channel = proto::tls::connect(&db_addr).await?;
     let db_client = server::db::database_client::DatabaseClient::new(channel);
-    let db_client = Arc::new(Mutex::new(db_client));
 
     let admin_service = AdminServiceImpl::new(db_client, keys);
 

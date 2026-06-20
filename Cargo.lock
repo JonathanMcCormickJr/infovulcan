@@ -180,6 +180,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -961,6 +970,7 @@ dependencies = [
  "prost",
  "prost-types",
  "proto",
+ "raft-rpc",
  "serde",
  "serde_json",
  "shared",
@@ -1019,6 +1029,7 @@ dependencies = [
  "postcard",
  "prost",
  "proto",
+ "raft-rpc",
  "rcgen",
  "serde",
  "serde_json",
@@ -1998,6 +2009,7 @@ name = "lbrp"
 version = "0.1.0-mvp.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "hyper",
  "jsonwebtoken",
@@ -2008,6 +2020,7 @@ dependencies = [
  "serde_json",
  "shared",
  "tempfile",
+ "test-support",
  "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
@@ -2488,19 +2501,6 @@ dependencies = [
  "quote",
  "semver",
  "syn 2.0.111",
-]
-
-[[package]]
-name = "openraft-memstore"
-version = "0.9.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c17e6dee9dffa39c538021f2cbf53915b7b07339f44d50ae6a5b9d107b19f882"
-dependencies = [
- "openraft",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -3140,6 +3140,16 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "raft-rpc"
+version = "0.1.0-mvp.1"
+dependencies = [
+ "openraft",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "rand"
@@ -3890,31 +3900,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spike-raft-toy"
-version = "0.1.0-mvp.1"
-dependencies = [
- "anyhow",
- "openraft",
- "openraft-memstore",
- "tokio",
-]
-
-[[package]]
-name = "spike-tonic-mtls"
-version = "0.1.0-mvp.1"
-dependencies = [
- "anyhow",
- "prost",
- "protoc-bin-vendored",
- "rcgen",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4021,6 +4006,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "test-support"
+version = "0.1.0-mvp.1"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -4806,6 +4798,7 @@ dependencies = [
  "leptos_router",
  "serde",
  "serde_json",
+ "thiserror 2.0.17",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

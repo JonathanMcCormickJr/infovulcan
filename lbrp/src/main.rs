@@ -27,8 +27,17 @@ pub(crate) fn env_or_default(raw: Option<String>, default_value: &str) -> String
     raw.unwrap_or_else(|| default_value.to_string())
 }
 
-pub(crate) fn jwt_secret_from_env(raw: Option<String>) -> Vec<u8> {
-    raw.map_or_else(|| b"secret".to_vec(), String::into_bytes)
+/// Resolve the JWT secret from the environment.
+///
+/// LBRP validates tokens minted by the auth service, so the two **must** share the same secret.
+/// Unlike auth (which can fall back to an on-disk generated secret), LBRP has no such file to
+/// share, so a missing/empty `JWT_SECRET` is a hard error rather than a silent weak default —
+/// otherwise every authenticated request would 401 with a confusing signature mismatch.
+pub(crate) fn jwt_secret_from_env(raw: Option<String>) -> Result<Vec<u8>, &'static str> {
+    match raw {
+        Some(secret) if !secret.is_empty() => Ok(secret.into_bytes()),
+        _ => Err("JWT_SECRET must be set on LBRP and must match the auth service's JWT_SECRET"),
+    }
 }
 
 /// Resolves the three backend service addresses from optional raw values, falling back to
@@ -114,9 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("LBRP services.toml reload enabled (every {reload_secs}s)");
     }
 
-    // JWT Secret (must match Auth service)
-    // In production, load from secure vault/env
-    let jwt_secret = jwt_secret_from_env(std::env::var("JWT_SECRET").ok());
+    // JWT Secret (must match Auth service). Required — see `jwt_secret_from_env`.
+    let jwt_secret = jwt_secret_from_env(std::env::var("JWT_SECRET").ok())?;
 
     let app_state = AppState {
         auth_client,

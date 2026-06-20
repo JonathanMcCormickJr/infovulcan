@@ -4,48 +4,28 @@
 //! handling incoming RPC calls from peer nodes in the Raft cluster.
 
 use crate::raft::{DbRaft, DbTypeConfig};
-use openraft::{LogId, Vote};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::debug;
 
 use crate::server::db::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     ProtoLogId, ProtoVote, VoteRequest, VoteResponse, raft_service_server::RaftService,
 };
 
-/// Encode an openraft [`openraft::raft::AppendEntriesResponse`] into the wire triple
-/// `(response_type, partial_success_index, vote)`.
-///
-/// Wire encoding: `0`=success, `1`=partial-success, `2`=conflict, `3`=higher-vote.
-/// For every variant except higher-vote the responder echoes the leader's vote;
-/// higher-vote carries the responder's strictly-greater vote that caused the rejection.
-fn encode_append_response(
-    resp: &openraft::raft::AppendEntriesResponse<u64>,
-    echoed_vote: ProtoVote,
-) -> (u32, Option<ProtoLogId>, ProtoVote) {
-    use openraft::raft::AppendEntriesResponse as Aer;
-    match resp {
-        Aer::Success => (0, None, echoed_vote),
-        Aer::PartialSuccess(matching) => (
-            1,
-            matching.as_ref().map(|log_id| ProtoLogId {
-                term: log_id.leader_id.term,
-                index: log_id.index,
-            }),
-            echoed_vote,
-        ),
-        Aer::Conflict => (2, None, echoed_vote),
-        Aer::HigherVote(higher) => (
-            3,
-            None,
-            ProtoVote {
-                term: higher.leader_id.term,
-                node_id: higher.leader_id.node_id,
-                committed: higher.committed,
-            },
-        ),
+/// Build a wire [`ProtoVote`] from the shared vote parts `(term, node_id, committed)`.
+fn to_proto_vote(parts: raft_rpc::VoteParts) -> ProtoVote {
+    let (term, node_id, committed) = parts;
+    ProtoVote {
+        term,
+        node_id,
+        committed,
     }
+}
+
+/// Build a wire [`ProtoLogId`] from the shared log-id parts `(term, index)`.
+fn to_proto_log_id(parts: raft_rpc::LogIdParts) -> ProtoLogId {
+    let (term, index) = parts;
+    ProtoLogId { term, index }
 }
 
 /// Implementation of the Raft service
@@ -63,105 +43,61 @@ impl RaftServiceImpl {
 
 #[tonic::async_trait]
 impl RaftService for RaftServiceImpl {
+    #[tracing::instrument(skip_all)]
     async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
         let req = request.into_inner();
 
-        debug!("received vote request: {:?}", req);
-
-        // Convert proto to openraft types
         let proto_vote = req
             .vote
             .ok_or_else(|| Status::invalid_argument("missing vote"))?;
 
-        let vote_req = openraft::raft::VoteRequest {
-            vote: Vote {
-                leader_id: openraft::LeaderId {
-                    term: proto_vote.term,
-                    node_id: proto_vote.node_id,
-                },
-                committed: proto_vote.committed,
-            },
-            last_log_id: req.last_log_id.map(|log_id| LogId {
-                leader_id: openraft::LeaderId {
-                    term: log_id.term,
-                    node_id: proto_vote.node_id,
-                },
-                index: log_id.index,
-            }),
-        };
+        let vote_req = raft_rpc::vote_request(
+            (proto_vote.term, proto_vote.node_id, proto_vote.committed),
+            req.last_log_id.map(|l| (l.term, l.index)),
+        );
 
-        // Forward to Raft
         let raft_response = self
             .raft
             .vote(vote_req)
             .await
             .map_err(|e| Status::internal(format!("vote failed: {e}")))?;
 
-        // Convert back to proto
         let proto_response = VoteResponse {
-            vote: Some(ProtoVote {
-                term: raft_response.vote.leader_id.term,
-                node_id: raft_response.vote.leader_id.node_id,
-                committed: raft_response.vote.committed,
-            }),
+            vote: Some(to_proto_vote(raft_rpc::vote_parts(&raft_response.vote))),
             vote_granted: raft_response.vote_granted,
-            last_log_id: raft_response.last_log_id.map(|log_id| ProtoLogId {
-                term: log_id.leader_id.term,
-                index: log_id.index,
-            }),
+            last_log_id: raft_response
+                .last_log_id
+                .as_ref()
+                .map(|l| to_proto_log_id(raft_rpc::log_id_parts(l))),
         };
 
         Ok(Response::new(proto_response))
     }
 
+    #[tracing::instrument(skip_all, fields(entries = request.get_ref().entries.len()))]
     async fn append_entries(
         &self,
         request: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesResponse>, Status> {
         let req = request.into_inner();
 
-        debug!(
-            "received append_entries request: entries={}",
-            req.entries.len()
-        );
-
-        // Convert proto to openraft types
         let proto_vote = req
             .vote
             .ok_or_else(|| Status::invalid_argument("missing vote"))?;
+        let vote_parts = (proto_vote.term, proto_vote.node_id, proto_vote.committed);
 
-        // Deserialize entries
-        let entries: Vec<openraft::Entry<DbTypeConfig>> = req
-            .entries
-            .into_iter()
-            .map(|entry| serde_json::from_slice(&entry.data))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Status::invalid_argument(format!("invalid entry data: {e}")))?;
+        // Entries are opaque serialized openraft entries.
+        let entries = raft_rpc::decode_entries::<DbTypeConfig>(
+            req.entries.into_iter().map(|entry| entry.data),
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        let append_req = openraft::raft::AppendEntriesRequest {
-            vote: openraft::Vote {
-                leader_id: openraft::LeaderId {
-                    term: proto_vote.term,
-                    node_id: proto_vote.node_id,
-                },
-                committed: proto_vote.committed,
-            },
-            prev_log_id: req.prev_log_id.map(|log_id| openraft::LogId {
-                leader_id: openraft::LeaderId {
-                    term: log_id.term,
-                    node_id: proto_vote.node_id,
-                },
-                index: log_id.index,
-            }),
+        let append_req = raft_rpc::append_request(
+            vote_parts,
+            req.prev_log_id.map(|l| (l.term, l.index)),
             entries,
-            leader_commit: req.leader_commit.map(|log_id| openraft::LogId {
-                leader_id: openraft::LeaderId {
-                    term: log_id.term,
-                    node_id: proto_vote.node_id,
-                },
-                index: log_id.index,
-            }),
-        };
+            req.leader_commit.map(|l| (l.term, l.index)),
+        );
 
         // Forward to Raft
         let raft_response = self
@@ -172,35 +108,24 @@ impl RaftService for RaftServiceImpl {
 
         // Map the openraft response into the typed wire response so the leader can
         // distinguish success / partial-success / log-conflict / higher-vote rejection.
-        let echoed_vote = ProtoVote {
-            term: proto_vote.term,
-            node_id: proto_vote.node_id,
-            committed: proto_vote.committed,
-        };
-        let (response_type, partial_success_index, vote) =
-            encode_append_response(&raft_response, echoed_vote);
+        let wire = raft_rpc::classify_append_response(&raft_response, vote_parts);
 
         let proto_response = AppendEntriesResponse {
-            vote: Some(vote),
-            response_type,
-            partial_success_index,
+            vote: Some(to_proto_vote(wire.vote)),
+            response_type: wire.response_type,
+            partial_success_index: wire.partial_index.map(to_proto_log_id),
         };
 
         Ok(Response::new(proto_response))
     }
 
+    #[tracing::instrument(skip_all, fields(offset = request.get_ref().offset, done = request.get_ref().done))]
     async fn install_snapshot(
         &self,
         request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let req = request.into_inner();
 
-        debug!(
-            "received install_snapshot request: offset={}, done={}",
-            req.offset, req.done
-        );
-
-        // Convert proto to openraft types
         let proto_vote = req
             .vote
             .ok_or_else(|| Status::invalid_argument("missing vote"))?;
@@ -209,33 +134,13 @@ impl RaftService for RaftServiceImpl {
             .ok_or_else(|| Status::invalid_argument("missing snapshot meta"))?;
 
         let install_req = openraft::raft::InstallSnapshotRequest {
-            vote: openraft::Vote {
-                leader_id: openraft::LeaderId {
-                    term: proto_vote.term,
-                    node_id: proto_vote.node_id,
-                },
-                committed: proto_vote.committed,
-            },
-            meta: openraft::SnapshotMeta {
-                last_log_id: proto_meta.last_log_id.map(|log_id| openraft::LogId {
-                    leader_id: openraft::LeaderId {
-                        term: log_id.term,
-                        node_id: proto_vote.node_id,
-                    },
-                    index: log_id.index,
-                }),
-                last_membership: openraft::StoredMembership::new(
-                    Some(openraft::LogId {
-                        leader_id: openraft::LeaderId {
-                            term: proto_meta.last_log_id.as_ref().map_or(0, |l| l.term),
-                            node_id: proto_vote.node_id,
-                        },
-                        index: u64::from(proto_meta.last_membership),
-                    }),
-                    openraft::Membership::new(vec![], ()),
-                ),
-                snapshot_id: proto_meta.snapshot_id,
-            },
+            vote: raft_rpc::vote((proto_vote.term, proto_vote.node_id, proto_vote.committed)),
+            meta: raft_rpc::snapshot_meta(
+                proto_meta.last_log_id.map(|l| (l.term, l.index)),
+                proto_meta.last_membership,
+                proto_meta.snapshot_id,
+                proto_vote.node_id,
+            ),
             offset: req.offset,
             data: req.data,
             done: req.done,
@@ -248,13 +153,8 @@ impl RaftService for RaftServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("install_snapshot failed: {e}")))?;
 
-        // Convert back to proto
         let proto_response = InstallSnapshotResponse {
-            vote: Some(ProtoVote {
-                term: raft_response.vote.leader_id.term,
-                node_id: raft_response.vote.leader_id.node_id,
-                committed: raft_response.vote.committed,
-            }),
+            vote: Some(to_proto_vote(raft_rpc::vote_parts(&raft_response.vote))),
         };
 
         Ok(Response::new(proto_response))
@@ -270,64 +170,8 @@ mod tests {
     use openraft::storage::Adaptor;
     use tonic::Request;
 
-    fn sample_vote() -> ProtoVote {
-        ProtoVote {
-            term: 7,
-            node_id: 2,
-            committed: true,
-        }
-    }
-
-    #[test]
-    fn encode_append_response_success() {
-        use openraft::raft::AppendEntriesResponse as Aer;
-        let (rt, idx, vote) = encode_append_response(&Aer::Success, sample_vote());
-        assert_eq!(rt, 0);
-        assert!(idx.is_none());
-        assert_eq!(vote.term, 7);
-    }
-
-    #[test]
-    fn encode_append_response_partial_success_carries_index() {
-        use openraft::raft::AppendEntriesResponse as Aer;
-        let log_id = openraft::LogId {
-            leader_id: openraft::LeaderId {
-                term: 4,
-                node_id: 1,
-            },
-            index: 11,
-        };
-        let (rt, idx, _) =
-            encode_append_response(&Aer::PartialSuccess(Some(log_id)), sample_vote());
-        assert_eq!(rt, 1);
-        let idx = idx.expect("partial success carries an index");
-        assert_eq!((idx.term, idx.index), (4, 11));
-    }
-
-    #[test]
-    fn encode_append_response_conflict() {
-        use openraft::raft::AppendEntriesResponse as Aer;
-        let (rt, idx, _) = encode_append_response(&Aer::Conflict, sample_vote());
-        assert_eq!(rt, 2);
-        assert!(idx.is_none());
-    }
-
-    #[test]
-    fn encode_append_response_higher_vote_reports_responder_vote() {
-        use openraft::raft::AppendEntriesResponse as Aer;
-        let higher = openraft::Vote {
-            leader_id: openraft::LeaderId {
-                term: 99,
-                node_id: 5,
-            },
-            committed: false,
-        };
-        let (rt, idx, vote) = encode_append_response(&Aer::HigherVote(higher), sample_vote());
-        assert_eq!(rt, 3);
-        assert!(idx.is_none());
-        // The responder's higher vote is reported, not the echoed leader vote.
-        assert_eq!((vote.term, vote.node_id), (99, 5));
-    }
+    // The openraft<->wire conversion logic (formerly `encode_append_response`) now lives in the
+    // shared `raft-rpc` crate and is unit-tested there; these handlers exercise the full path.
 
     async fn test_service() -> RaftServiceImpl {
         let store = DbStore::new_temp().expect("temp store");

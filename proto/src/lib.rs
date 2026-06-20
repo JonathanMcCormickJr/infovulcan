@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+// Generated tonic/prost code does not follow our pedantic style; silence it crate-wide. The
+// hand-written modules (`pqc`, `tls`) are small and reviewed separately.
 #![allow(clippy::all, clippy::pedantic)]
 
 pub mod admin {

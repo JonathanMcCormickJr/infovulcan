@@ -1,0 +1,13 @@
+[package]
+name = "test-support"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Test-only helpers shared across the workspace's unit/integration tests. Pulled in as a
+# dev-dependency, never as a runtime dependency.
+
+[dependencies]
+tokio = { version = "1.48", features = ["rt", "sync"] }

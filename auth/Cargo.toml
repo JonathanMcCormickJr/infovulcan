@@ -23,18 +23,13 @@ proto = { path = "../proto" }
 
 # Crypto & Auth
 argon2 = "0.5"
-<<<<<<< HEAD
-jsonwebtoken = { version = "10.2", default-features = false, features = ["rust_crypto"] }
-rand = "0.10.1"
-=======
 # Use the aws-lc-rs crypto provider instead of the pure-Rust `rust_crypto` one: the latter pulls
 # the `rsa` crate, which carries the unfixed Marvin timing advisory (RUSTSEC-2023-0071). aws-lc-rs
 # provides the HS256 we use (and any RSA) without that crate. `use_pem` for key parsing.
 jsonwebtoken = { version = "10.2", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-rand = "0.10.0"
+rand = "0.10.1"
 # TOTP (RFC 6238) for MFA verification
 totp-rs = { version = "5.7", default-features = false }
->>>>>>> 0989921 (Saving progress after getting cargo tarpaulin >90% for workspace)
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

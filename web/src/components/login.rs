@@ -27,7 +27,7 @@ pub fn Login() -> impl IntoView {
                     navigate("/tickets", leptos_router::NavigateOptions::default());
                 }
                 Err(err) => {
-                    set_error.set(err);
+                    set_error.set(err.to_string());
                 }
             }
             set_is_loading.set(false);

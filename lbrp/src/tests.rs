@@ -42,9 +42,11 @@ mod tests {
             "http://custom:1".to_string()
         );
 
-        assert_eq!(jwt_secret_from_env(None), b"secret".to_vec());
+        // A missing or empty secret is a hard error (no weak default).
+        assert!(jwt_secret_from_env(None).is_err());
+        assert!(jwt_secret_from_env(Some(String::new())).is_err());
         assert_eq!(
-            jwt_secret_from_env(Some("abc".to_string())),
+            jwt_secret_from_env(Some("abc".to_string())).expect("secret present"),
             b"abc".to_vec()
         );
     }

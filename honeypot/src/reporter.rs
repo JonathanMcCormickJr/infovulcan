@@ -154,8 +154,7 @@ mod tests {
         // locally and the subsequent gRPC send fails, exercising the error branch.
         let channel = proto::tls::connect_lazy("http://127.0.0.1:1").unwrap();
         let reporter = Reporter::with_client(AdminServiceClient::new(channel));
-        let event =
-            IntrusionEvent::new("9.9.9.9".to_string(), "/x".to_string(), "GET".to_string());
+        let event = IntrusionEvent::new("9.9.9.9".to_string(), "/x".to_string(), "GET".to_string());
         reporter.report(&event).await; // must not panic; the failed send is logged
     }
 }

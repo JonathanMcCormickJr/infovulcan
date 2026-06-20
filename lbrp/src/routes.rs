@@ -49,11 +49,13 @@ pub enum ApiNextAction {
     AutoClose { schedule: String },
 }
 
-fn map_next_action(
-    next_action: Option<crate::clients::custodian::NextAction>,
-) -> Option<ApiNextAction> {
+/// Map a custodian `NextAction` to an `Option<ApiNextAction>` (an unset `kind` means "no action
+/// scheduled" → `null` in JSON). This stays a free function rather than a `From` impl: the orphan
+/// rule forbids `impl From<custodian::NextAction> for Option<ApiNextAction>` (the local type sits
+/// behind `Option`'s uncovered type parameter).
+fn map_next_action(next_action: crate::clients::custodian::NextAction) -> Option<ApiNextAction> {
     use crate::clients::custodian::{AutoCloseSchedule, next_action::Kind};
-    let kind = next_action?.kind?;
+    let kind = next_action.kind?;
     Some(match kind {
         Kind::FollowUp(ts) => ApiNextAction::FollowUp { at: ts.seconds },
         Kind::Appointment(ts) => ApiNextAction::Appointment { at: ts.seconds },
@@ -81,14 +83,16 @@ pub struct ApiTicket {
     pub next_action: Option<ApiNextAction>,
 }
 
-fn map_ticket(ticket: crate::clients::custodian::Ticket) -> ApiTicket {
-    ApiTicket {
-        ticket_id: ticket.ticket_id,
-        title: ticket.title,
-        project: ticket.project,
-        priority: ticket.priority,
-        status: ticket.status,
-        next_action: map_next_action(ticket.next_action),
+impl From<crate::clients::custodian::Ticket> for ApiTicket {
+    fn from(ticket: crate::clients::custodian::Ticket) -> Self {
+        Self {
+            ticket_id: ticket.ticket_id,
+            title: ticket.title,
+            project: ticket.project,
+            priority: ticket.priority,
+            status: ticket.status,
+            next_action: ticket.next_action.and_then(map_next_action),
+        }
     }
 }
 
@@ -96,20 +100,17 @@ async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut client = state.auth_client.client.lock().await;
-
     let req = crate::clients::auth::AuthenticateRequest {
         username: payload.username,
         password: payload.password,
         mfa_token: payload.mfa_token.unwrap_or_default(),
     };
 
-    let resp = client.authenticate(req).await.map_err(|e| {
+    let resp_inner = state.auth_client.authenticate(req).await.map_err(|e| {
         tracing::error!("Auth service error: {}", e);
         ApiError::from(e)
     })?;
 
-    let resp_inner = resp.into_inner();
     if resp_inner.success {
         Ok(Json(LoginResponse {
             token: resp_inner.session_token,
@@ -134,8 +135,6 @@ async fn create_user(
     State(state): State<AppState>,
     Json(payload): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut client = state.admin_client.client.lock().await;
-
     let req = crate::clients::admin::CreateUserRequest {
         username: payload.username,
         password: payload.password,
@@ -144,9 +143,138 @@ async fn create_user(
         role: payload.role,
     };
 
-    let _resp = client.create_user(req).await.map_err(ApiError::from)?;
+    state
+        .admin_client
+        .create_user(req)
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(StatusCode::CREATED)
+}
+
+/// JSON representation of a user returned by the admin endpoints.
+#[derive(Serialize)]
+pub struct ApiUser {
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    pub display_name: String,
+    pub role: i32,
+    pub active: bool,
+    pub created_at: u64,
+}
+
+impl From<crate::clients::admin::User> for ApiUser {
+    fn from(user: crate::clients::admin::User) -> Self {
+        Self {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            display_name: user.display_name,
+            role: user.role,
+            active: user.active,
+            created_at: user.created_at,
+        }
+    }
+}
+
+/// Query params for `GET /api/admin/users` (e.g. `?page=0&page_size=50`).
+#[derive(Deserialize)]
+pub struct ListUsersParams {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct ListUsersResponse {
+    pub users: Vec<ApiUser>,
+    pub total_count: u32,
+}
+
+async fn list_users(
+    State(state): State<AppState>,
+    Query(params): Query<ListUsersParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = crate::clients::admin::ListUsersRequest {
+        page: params.page.unwrap_or(0),
+        page_size: params.page_size.unwrap_or(0),
+    };
+
+    let resp = state
+        .admin_client
+        .list_users(req)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(ListUsersResponse {
+        users: resp.users.into_iter().map(ApiUser::from).collect(),
+        total_count: resp.total_count,
+    }))
+}
+
+async fn get_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let resp = state
+        .admin_client
+        .get_user(crate::clients::admin::GetUserRequest { id })
+        .await
+        .map_err(ApiError::from)?;
+
+    let user = resp
+        .user
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
+    Ok(Json(ApiUser::from(user)))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRequest {
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub role: Option<i32>,
+    pub active: Option<bool>,
+    pub password: Option<String>,
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateUserRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let req = crate::clients::admin::UpdateUserRequest {
+        id,
+        email: payload.email,
+        display_name: payload.display_name,
+        role: payload.role,
+        active: payload.active,
+        password: payload.password,
+    };
+
+    let resp = state
+        .admin_client
+        .update_user(req)
+        .await
+        .map_err(ApiError::from)?;
+
+    let user = resp
+        .user
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
+    Ok(Json(ApiUser::from(user)))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Soft delete (audit-trail requirement): the admin service marks the user inactive.
+    state
+        .admin_client
+        .delete_user(crate::clients::admin::DeleteUserRequest { id })
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Custodian Handlers ---
@@ -186,7 +314,7 @@ async fn create_ticket(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok((StatusCode::CREATED, Json(map_ticket(resp))))
+    Ok((StatusCode::CREATED, Json(ApiTicket::from(resp))))
 }
 
 async fn get_ticket(
@@ -201,7 +329,7 @@ async fn get_ticket(
         .await
         .map_err(|e| ApiError::not_found(e.to_string()))?;
 
-    Ok(Json(map_ticket(resp)))
+    Ok(Json(ApiTicket::from(resp)))
 }
 
 /// Query params for `GET /api/tickets` (e.g. `?status=1&assignee=<uuid>&project=foo`).
@@ -234,8 +362,51 @@ async fn list_tickets(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let out: Vec<ApiTicket> = tickets.into_iter().map(map_ticket).collect();
+    let out: Vec<ApiTicket> = tickets.into_iter().map(ApiTicket::from).collect();
     Ok(Json(out))
+}
+
+/// Inbound (writable) form of a ticket's next action. Mirrors [`ApiNextAction`] but adds an
+/// explicit `none` variant to *clear* a scheduled action. Omitting the `next_action` field
+/// entirely leaves the existing action unchanged.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApiNextActionInput {
+    /// Clear any scheduled action.
+    None,
+    /// Follow up at the given unix-seconds timestamp.
+    FollowUp { at: i64 },
+    /// Appointment at the given unix-seconds timestamp.
+    Appointment { at: i64 },
+    /// Auto-close on a named schedule (`end_of_day` | `hours_24` | `hours_48` | `hours_72`).
+    AutoClose { schedule: String },
+}
+
+/// Map a writable next-action into the custodian proto message.
+///
+/// The returned message is always wrapped in `Some(..)` by the caller so the custodian
+/// *applies* it (a `kind: None` message clears the action; an absent field leaves it alone).
+fn to_proto_next_action(input: ApiNextActionInput) -> crate::clients::custodian::NextAction {
+    use crate::clients::custodian::{AutoCloseSchedule, NextAction, next_action::Kind};
+    let ts = |at: i64| prost_types::Timestamp {
+        seconds: at,
+        nanos: 0,
+    };
+    let kind = match input {
+        ApiNextActionInput::None => None,
+        ApiNextActionInput::FollowUp { at } => Some(Kind::FollowUp(ts(at))),
+        ApiNextActionInput::Appointment { at } => Some(Kind::Appointment(ts(at))),
+        ApiNextActionInput::AutoClose { schedule } => {
+            let sched = match schedule.as_str() {
+                "hours_24" => AutoCloseSchedule::Hours24,
+                "hours_48" => AutoCloseSchedule::Hours48,
+                "hours_72" => AutoCloseSchedule::Hours72,
+                _ => AutoCloseSchedule::EndOfDay,
+            };
+            Some(Kind::AutoClose(sched as i32))
+        }
+    };
+    NextAction { kind }
 }
 
 #[derive(Deserialize)]
@@ -244,6 +415,9 @@ pub struct UpdateTicketRequest {
     pub project: Option<String>,
     pub priority: Option<i32>,
     pub status: Option<i32>,
+    /// Optional. Present → set/clear the scheduled next action; absent → leave unchanged.
+    #[serde(default)]
+    pub next_action: Option<ApiNextActionInput>,
 }
 
 async fn update_ticket(
@@ -259,7 +433,7 @@ async fn update_ticket(
         symptom: None,
         priority: payload.priority,
         status: payload.status,
-        next_action: None,
+        next_action: payload.next_action.map(to_proto_next_action),
         resolution: None,
         assigned_to_uuid: None,
         updated_by_uuid: Some(claims.sub),
@@ -274,7 +448,7 @@ async fn update_ticket(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok(Json(map_ticket(resp)))
+    Ok(Json(ApiTicket::from(resp)))
 }
 
 #[derive(Serialize)]
@@ -283,19 +457,30 @@ pub struct HealthResponse {
     pub services: std::collections::BTreeMap<String, &'static str>,
 }
 
-/// Aggregated health endpoint. Probes reachable downstream services and reports overall
-/// status (`200 ok` / `503 degraded`). Currently probes the custodian (via its cluster
-/// status); auth/db lack a Health RPC reachable from LBRP and are a tracked follow-up.
+/// Aggregated health endpoint. Probes the backends LBRP connects to directly and reports
+/// overall status (`200 ok` / `503 degraded`). Probes run concurrently:
+/// - **auth** via a DB-free `validate_session` liveness call,
+/// - **custodian** via its cluster status.
+///
+/// The DB is intentionally *not* probed here: LBRP does not hold a direct DB connection
+/// (it reaches data only through custodian/auth), so DB health is covered transitively —
+/// a custodian or auth data call fails if the DB is down. `admin` is Hardened-only and not
+/// part of the MVP topology, so it is likewise omitted from the baseline probe.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let mut services = std::collections::BTreeMap::new();
 
-    let custodian_ok = state.custodian_client.cluster_status().await.is_ok();
+    let (auth_ok, custodian_ok) =
+        tokio::join!(async { state.auth_client.health().await.is_ok() }, async {
+            state.custodian_client.cluster_status().await.is_ok()
+        },);
+
+    services.insert("auth".to_string(), if auth_ok { "up" } else { "down" });
     services.insert(
         "custodian".to_string(),
         if custodian_ok { "up" } else { "down" },
     );
 
-    let all_ok = custodian_ok;
+    let all_ok = auth_ok && custodian_ok;
     let status = if all_ok { "ok" } else { "degraded" };
     let code = if all_ok {
         StatusCode::OK
@@ -315,6 +500,13 @@ pub fn app(state: AppState) -> Router {
     let api_routes = Router::new()
         .route("/tickets", post(create_ticket).get(list_tickets))
         .route("/tickets/{id}", get(get_ticket).put(update_ticket))
+        // User management (admin). Creation is bootstrap-only above (unauthenticated);
+        // listing, reads, updates, and soft-deletes require a valid JWT.
+        .route("/admin/users", get(list_users))
+        .route(
+            "/admin/users/{id}",
+            get(get_user).put(update_user).delete(delete_user),
+        )
         .layer(middleware::from_fn_with_state(
             state.auth_state.clone(),
             auth_middleware,
@@ -357,13 +549,11 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use jsonwebtoken::{EncodingKey, Header, encode};
-    use std::net::TcpListener;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Mutex;
+
     use tokio::sync::oneshot;
     use tonic::transport::Channel;
-    use tonic::transport::Server;
     use tower::ServiceExt;
 
     // ===== Mock gRPC service implementations =====
@@ -409,7 +599,15 @@ mod tests {
             _req: tonic::Request<crate::clients::auth::ValidateSessionRequest>,
         ) -> Result<tonic::Response<crate::clients::auth::ValidateSessionResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not needed"))
+            // A benign, DB-free response so the `/health` liveness probe sees a successful
+            // round-trip (the empty token is "invalid", which is exactly what the probe expects).
+            Ok(tonic::Response::new(
+                crate::clients::auth::ValidateSessionResponse {
+                    valid: false,
+                    user: None,
+                    error: "invalid".to_string(),
+                },
+            ))
         }
 
         async fn logout(
@@ -447,10 +645,22 @@ mod tests {
 
         async fn get_user(
             &self,
-            _req: tonic::Request<crate::clients::admin::GetUserRequest>,
+            req: tonic::Request<crate::clients::admin::GetUserRequest>,
         ) -> Result<tonic::Response<crate::clients::admin::GetUserResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not needed"))
+            Ok(tonic::Response::new(
+                crate::clients::admin::GetUserResponse {
+                    user: Some(crate::clients::admin::User {
+                        id: req.into_inner().id,
+                        username: "alice".to_string(),
+                        email: "a@example.com".to_string(),
+                        display_name: "Alice".to_string(),
+                        role: 0,
+                        active: true,
+                        created_at: 123,
+                    }),
+                },
+            ))
         }
 
         async fn list_users(
@@ -458,15 +668,41 @@ mod tests {
             _req: tonic::Request<crate::clients::admin::ListUsersRequest>,
         ) -> Result<tonic::Response<crate::clients::admin::ListUsersResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not needed"))
+            Ok(tonic::Response::new(
+                crate::clients::admin::ListUsersResponse {
+                    users: vec![crate::clients::admin::User {
+                        id: "id-1".to_string(),
+                        username: "alice".to_string(),
+                        email: "a@example.com".to_string(),
+                        display_name: "Alice".to_string(),
+                        role: 0,
+                        active: true,
+                        created_at: 123,
+                    }],
+                    total_count: 1,
+                },
+            ))
         }
 
         async fn update_user(
             &self,
-            _req: tonic::Request<crate::clients::admin::UpdateUserRequest>,
+            req: tonic::Request<crate::clients::admin::UpdateUserRequest>,
         ) -> Result<tonic::Response<crate::clients::admin::UpdateUserResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not needed"))
+            let r = req.into_inner();
+            Ok(tonic::Response::new(
+                crate::clients::admin::UpdateUserResponse {
+                    user: Some(crate::clients::admin::User {
+                        id: r.id,
+                        username: "alice".to_string(),
+                        email: r.email.unwrap_or_else(|| "a@example.com".to_string()),
+                        display_name: r.display_name.unwrap_or_else(|| "Alice".to_string()),
+                        role: r.role.unwrap_or(0),
+                        active: r.active.unwrap_or(true),
+                        created_at: 123,
+                    }),
+                },
+            ))
         }
 
         async fn delete_user(
@@ -474,7 +710,9 @@ mod tests {
             _req: tonic::Request<crate::clients::admin::DeleteUserRequest>,
         ) -> Result<tonic::Response<crate::clients::admin::DeleteUserResponse>, tonic::Status>
         {
-            Err(tonic::Status::unimplemented("not needed"))
+            Ok(tonic::Response::new(
+                crate::clients::admin::DeleteUserResponse { success: true },
+            ))
         }
 
         async fn push_metrics(
@@ -599,55 +837,21 @@ mod tests {
     // ===== Server startup helpers =====
 
     fn start_mock_auth(svc: MockAuthSvc) -> (std::net::SocketAddr, oneshot::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        drop(listener);
-        let (tx, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(crate::clients::auth::auth_service_server::AuthServiceServer::new(svc))
-                .serve_with_shutdown(addr, async {
-                    let _ = rx.await;
-                })
-                .await;
-        });
-        (addr, tx)
+        test_support::spawn_grpc!(
+            crate::clients::auth::auth_service_server::AuthServiceServer::new(svc)
+        )
     }
 
     fn start_mock_admin(svc: MockAdminSvc) -> (std::net::SocketAddr, oneshot::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        drop(listener);
-        let (tx, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(
-                    crate::clients::admin::admin_service_server::AdminServiceServer::new(svc),
-                )
-                .serve_with_shutdown(addr, async {
-                    let _ = rx.await;
-                })
-                .await;
-        });
-        (addr, tx)
+        test_support::spawn_grpc!(
+            crate::clients::admin::admin_service_server::AdminServiceServer::new(svc)
+        )
     }
 
     fn start_mock_custodian(svc: MockCustodianSvc) -> (std::net::SocketAddr, oneshot::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-        drop(listener);
-        let (tx, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(
-                    crate::clients::custodian::custodian_service_server::CustodianServiceServer::new(svc),
-                )
-                .serve_with_shutdown(addr, async {
-                    let _ = rx.await;
-                })
-                .await;
-        });
-        (addr, tx)
+        test_support::spawn_grpc!(
+            crate::clients::custodian::custodian_service_server::CustodianServiceServer::new(svc)
+        )
     }
 
     async fn connect_retry(addr: std::net::SocketAddr) -> Channel {
@@ -667,35 +871,21 @@ mod tests {
 
     fn make_state_with_auth_ch(ch: Channel) -> AppState {
         AppState {
-            auth_client: AuthClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::auth::auth_service_client::AuthServiceClient::new(ch),
-                )),
-            },
+            auth_client: AuthClient::from_channel(ch),
             ..test_state()
         }
     }
 
     fn make_state_with_admin_ch(ch: Channel) -> AppState {
         AppState {
-            admin_client: AdminClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::admin::admin_service_client::AdminServiceClient::new(ch),
-                )),
-            },
+            admin_client: AdminClient::from_channel(ch),
             ..test_state()
         }
     }
 
     fn make_state_with_custodian_ch(ch: Channel) -> AppState {
         AppState {
-            custodian_client: CustodianClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::custodian::custodian_service_client::CustodianServiceClient::new(
-                        ch,
-                    ),
-                )),
-            },
+            custodian_client: CustodianClient::from_channel(ch),
             ..test_state()
         }
     }
@@ -819,6 +1009,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_users_returns_users_from_backend() {
+        let (addr, shutdown) = start_mock_admin(MockAdminSvc);
+        let ch = connect_retry(addr).await;
+        let result = list_users(
+            State(make_state_with_admin_ch(ch)),
+            Query(ListUsersParams {
+                page: Some(0),
+                page_size: Some(50),
+            }),
+        )
+        .await;
+        let _ = shutdown.send(());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_user_returns_user_on_backend_success() {
+        let (addr, shutdown) = start_mock_admin(MockAdminSvc);
+        let ch = connect_retry(addr).await;
+        let result = get_user(State(make_state_with_admin_ch(ch)), Path("id-1".into())).await;
+        let _ = shutdown.send(());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_user_returns_user_on_backend_success() {
+        let (addr, shutdown) = start_mock_admin(MockAdminSvc);
+        let ch = connect_retry(addr).await;
+        let result = update_user(
+            State(make_state_with_admin_ch(ch)),
+            Path("id-1".into()),
+            Json(UpdateUserRequest {
+                email: Some("new@example.com".into()),
+                display_name: None,
+                role: Some(1),
+                active: Some(false),
+                password: None,
+            }),
+        )
+        .await;
+        let _ = shutdown.send(());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_user_returns_no_content_on_backend_success() {
+        let (addr, shutdown) = start_mock_admin(MockAdminSvc);
+        let ch = connect_retry(addr).await;
+        let result = delete_user(State(make_state_with_admin_ch(ch)), Path("id-1".into())).await;
+        let _ = shutdown.send(());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn user_management_handlers_error_when_backend_unreachable() {
+        assert!(
+            list_users(
+                State(test_state()),
+                Query(ListUsersParams {
+                    page: None,
+                    page_size: None,
+                }),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            get_user(State(test_state()), Path("id-1".into()))
+                .await
+                .is_err()
+        );
+        assert!(
+            delete_user(State(test_state()), Path("id-1".into()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn get_ticket_returns_ticket_on_backend_success() {
         let (addr, shutdown) = start_mock_custodian(MockCustodianSvc);
         let ch = connect_retry(addr).await;
@@ -860,11 +1129,42 @@ mod tests {
                 project: None,
                 priority: None,
                 status: None,
+                next_action: Some(ApiNextActionInput::FollowUp { at: 1_700_000_000 }),
             }),
         )
         .await;
         let _ = shutdown.send(());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn to_proto_next_action_maps_each_variant() {
+        use crate::clients::custodian::{AutoCloseSchedule, next_action::Kind};
+
+        assert!(
+            to_proto_next_action(ApiNextActionInput::None)
+                .kind
+                .is_none()
+        );
+
+        let follow = to_proto_next_action(ApiNextActionInput::FollowUp { at: 42 }).kind;
+        assert!(matches!(follow, Some(Kind::FollowUp(ts)) if ts.seconds == 42));
+
+        let appt = to_proto_next_action(ApiNextActionInput::Appointment { at: 99 }).kind;
+        assert!(matches!(appt, Some(Kind::Appointment(ts)) if ts.seconds == 99));
+
+        let ac = to_proto_next_action(ApiNextActionInput::AutoClose {
+            schedule: "hours_48".into(),
+        })
+        .kind;
+        assert!(matches!(ac, Some(Kind::AutoClose(v)) if v == AutoCloseSchedule::Hours48 as i32));
+
+        // Unknown schedule falls back to end-of-day.
+        let eod = to_proto_next_action(ApiNextActionInput::AutoClose {
+            schedule: "bogus".into(),
+        })
+        .kind;
+        assert!(matches!(eod, Some(Kind::AutoClose(v)) if v == AutoCloseSchedule::EndOfDay as i32));
     }
 
     #[tokio::test]
@@ -888,19 +1188,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_ok_when_custodian_reachable() {
-        let (addr, shutdown) = start_mock_custodian(MockCustodianSvc);
-        let ch = connect_retry(addr).await;
-        let resp = health(State(make_state_with_custodian_ch(ch)))
-            .await
-            .into_response();
-        let _ = shutdown.send(());
+    async fn health_reports_ok_when_auth_and_custodian_reachable() {
+        let (auth_addr, auth_shutdown) = start_mock_auth(MockAuthSvc {
+            error_code: None,
+            auth_success: true,
+        });
+        let (cust_addr, cust_shutdown) = start_mock_custodian(MockCustodianSvc);
+        let auth_ch = connect_retry(auth_addr).await;
+        let cust_ch = connect_retry(cust_addr).await;
+
+        let state = AppState {
+            auth_client: AuthClient::from_channel(auth_ch),
+            custodian_client: CustodianClient::from_channel(cust_ch),
+            ..test_state()
+        };
+
+        let resp = health(State(state)).await.into_response();
+        let _ = auth_shutdown.send(());
+        let _ = cust_shutdown.send(());
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn health_reports_degraded_when_custodian_unreachable() {
-        // Lazy channel to a dead port: cluster_status fails -> degraded/503.
+    async fn health_reports_degraded_when_auth_down_but_custodian_up() {
+        // Only custodian is reachable; auth points at a dead port → degraded/503.
+        let (cust_addr, cust_shutdown) = start_mock_custodian(MockCustodianSvc);
+        let cust_ch = connect_retry(cust_addr).await;
+        let resp = health(State(make_state_with_custodian_ch(cust_ch)))
+            .await
+            .into_response();
+        let _ = cust_shutdown.send(());
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn health_reports_degraded_when_all_backends_unreachable() {
+        // Lazy channels to dead ports: both probes fail -> degraded/503.
         let resp = health(State(test_state())).await.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -920,25 +1243,9 @@ mod tests {
     fn test_state() -> AppState {
         let channel = Channel::from_static("http://127.0.0.1:9").connect_lazy();
         AppState {
-            auth_client: AuthClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::auth::auth_service_client::AuthServiceClient::new(
-                        channel.clone(),
-                    ),
-                )),
-            },
-            admin_client: AdminClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::admin::admin_service_client::AdminServiceClient::new(
-                        channel.clone(),
-                    ),
-                )),
-            },
-            custodian_client: CustodianClient {
-                client: Arc::new(Mutex::new(
-                    crate::clients::custodian::custodian_service_client::CustodianServiceClient::new(channel),
-                )),
-            },
+            auth_client: AuthClient::from_channel(channel.clone()),
+            admin_client: AdminClient::from_channel(channel.clone()),
+            custodian_client: CustodianClient::from_channel(channel),
             auth_state: Arc::new(AuthState {
                 jwt_secret: b"secret".to_vec(),
             }),
@@ -971,7 +1278,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mapped = map_ticket(source);
+        let mapped = ApiTicket::from(source);
         assert_eq!(mapped.ticket_id, 42);
         assert_eq!(mapped.title, "Demo");
         assert_eq!(mapped.project, "InfoVulcan");

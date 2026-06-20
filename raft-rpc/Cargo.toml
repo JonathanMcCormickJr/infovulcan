@@ -1,0 +1,14 @@
+[package]
+name = "raft-rpc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Raft consensus types (must match the version used by db & custodian).
+openraft = { version = "0.9", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

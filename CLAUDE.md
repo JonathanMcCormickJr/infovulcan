@@ -53,7 +53,7 @@ LBRP (REST/HTTPS, port 443)     ← Public entry point; Axum-based
     ├──→ Custodian (gRPC, :8081) ← Raft cluster; distributed ticket locks
     └──→ Admin (gRPC, :8083)    ← Stateless user/role management (Hardened+)
               ↓                            ↓                        ↓
-         DB Service (gRPC, :8080)  ← Raft cluster; all data persistence (Sled)
+         DB Service (gRPC, :50051) ← Raft cluster; all data persistence (Sled)
 
 Hardened-only additions:
   Chaos (:8084) — fault injection for resilience testing
